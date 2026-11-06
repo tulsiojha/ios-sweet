@@ -56,9 +56,9 @@ def main():
         rd = open(a.ramdisk_blob, "rb").read()
         if len(rd) > rd_sz:
             sys.exit(f"ramdisk blob {len(rd)} > stock ramdisk region {rd_sz}")
-        off = page + ker_sz
-        d[off:off + rd_sz] = rd + b"\0" * (rd_sz - len(rd))
-        rd_note = f", ramdisk blob {len(rd)} bytes padded to {rd_sz}"
+        rd_off = (page + ker_sz + page - 1) & ~(page - 1)	# sections are page aligned
+        d[rd_off:rd_off + rd_sz] = rd + b"\0" * (rd_sz - len(rd))
+        rd_note = f", ramdisk blob {len(rd)} bytes @ {rd_off:#x} padded to {rd_sz}"
     if a.cmdline is not None:
         c = a.cmdline.encode()
         if len(c) >= 512:
