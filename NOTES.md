@@ -193,31 +193,58 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   pe_identify_machine.c). GICv2 for msm8916 is new platform code behind those interfaces
   either way. Also, os/log.c needs Apple-internal `<os/firehose_buffer_private.h>`; the
   OSS drop ships neither the header nor the reserve/flush implementation.
-- **xnu-4903 local build state (2026-11-06):** apple-oss-distributions/xnu tag
-  xnu-4903.270.47 (commit 494ffe1) at /tmp/xnu-4903. Invocation:
-  `make ARCH_CONFIGS=ARM64 KERNEL_CONFIGS=DEVELOPMENT MACHINE_CONFIGS=T7000 SDKROOT=macosx
+- **xnu-4903 local build state (2026-11-06): LINKS AND BUILDS CLEAN.** apple-oss-distributions/xnu
+  tag xnu-4903.270.47 (commit 494ffe1) at /tmp/xnu-4903. Invocation: `make
+  ARCH_CONFIGS=ARM64 KERNEL_CONFIGS=DEVELOPMENT MACHINE_CONFIGS=T7000 SDKROOT=macosx
   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64
-  INCFLAGS_SDK=-I/tmp/xnu-4903/stage/usr/local/include/kernel BUILD_WERROR=0`.
-  Modern-toolchain fixes found so far (local, uncommitted): python3 shebang in
-  bsd/kern/makekdebugevents.py; create BUILD/obj/EXPORT_HDRS/libsa and
-  stage/usr/local/include/kernel (empty, satisfy -Wmissing-include-dirs); add
-  `options MONOTONIC` to config/MASTER.arm64 (machine/monotonic.h uses MT_CORE_NFIXED
-  unguarded); replace the assym.s sed with makedefs/genassym_extract.py (modern clang
-  folds single-char `.ascii "4"` into `.byte 52`, which the sed cannot parse and which
-  also duplicated the label); vendor libkern/os/firehose_buffer_private.h (kernel subset
-  of libdispatch-913.60.2) + libkern/os/firehose_buffer_stub.c (reserve returns NULL,
-  flush no-op; os_log falls back to firehose_boot_chunk).
+  INCFLAGS_SDK=-I/tmp/xnu-4903/stage/usr/local/include/kernel BUILD_WERROR=0
+  CTFCONVERT=/usr/bin/true CTFMERGE=/usr/bin/true -j8 -k` (CTF overrides silence xcrun
+  parse noise; no CTF data is embedded). Result:
+  BUILD/obj/DEVELOPMENT_ARM64_T7000/kernel.development.t7000 (10,192,464 B stripped,
+  11,563,192 B unstripped; Mach-O arm64, entry 0xfffffff0070f90a0 in __TEXT_EXEC,
+  __TEXT at 0xfffffff007004000). Full patch set saved as
+  `ports/vivo-y21l/xnu-4903-arm64-oss-build.patch` (12 files, `git apply` on 494ffe1):
+  (1) python3 - shebangs in bsd/kern/makekdebugevents.py and
+  tools/lldbmacros/core/syntax_checker.py (rewritten for py3), and `PYTHON ?= python3`
+  in makedefs/MakeInc.cmd (it was empty, so the INSTALLPYTHON rule ran the scripts via
+  their `#!/usr/bin/env python` shebang);
+  (2) create BUILD/obj/EXPORT_HDRS/libsa and stage/usr/local/include/kernel (empty,
+  satisfy -Wmissing-include-dirs);
+  (3) `options MONOTONIC` in config/MASTER.arm64 (machine/monotonic.h uses MT_CORE_NFIXED
+  unguarded);
+  (4) makedefs/genassym_extract.py replaces the assym.s sed (modern clang folds
+  single-char `.ascii "4"` into `.byte 52`, which the sed cannot parse and which also
+  duplicated the label);
+  (5) firehose - vendor libkern/os/firehose_buffer_private.h (20180226 SPI shape, from
+  libdispatch-1008.250.7; 4903's subr_log.c wants DEFAULT_CHUNK_COUNT/DEFAULT_IO_PAGES and
+  the variable-based CHUNK_COUNT), stub the five kernel entry points in
+  libkern/os/firehose_buffer_stub.c (create returns NULL, merge_updates no-op,
+  configuration_valid keeps libdispatch's predicate), export the header from libkern/os,
+  drop `-lfirehose_kernel` in makedefs/MakeInc.def (Apple-private, unpublished);
+  (6) osfmk/arm64/locore.s - `exc_vectors_table` (__ARM_KERNEL_PROTECT__) was 12 absolute
+  .quad handler pointers in __TEXT, which modern ld64 rejects ("Illegal text-relocations");
+  entries are now 32-bit offsets relative to the table and BRANCH_TO_KVA_VECTOR computes
+  `table + off` via x16 (free scratch at vector entry). The image stays -pie.
+  OBSERVATION: modern ld64 with `-static -pie` emits NO LC_DYLD_INFO and no chained
+  fixups for this image, so it is relocation-free and must run at link-time VAs
+  (slide 0). mkpayload.py accepts it unchanged (`fixups: 0`, virt_base
+  0xfffffff006000000, kernel_end 0xfffffff007a50000, blob /tmp/payload-xnu4903.bin);
+  stage0's loader already maps by payload virt_base and passes virtBase/physBase
+  0x88000000 in boot_args, and xnu then computes
+  vm_kernel_slide = segTEXTB - VM_KERNEL_LINK_ADDRESS = 0. Not yet boot-tested.
 - **Port deltas vs sweet:** 32-bit stage0 (real one) must switch AArch32 EL2 -> AArch64
   (lk2nd-style HCR.RW + eret) and then jump to the AArch64 payload; SDHCI eMMC driver,
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) finish the xnu-4903 modern-toolchain patch set until mach_kernel
-  links, then add a repo CI workflow for it (the pinned blacktop build path cannot build
-  10.14-era xnu); (2) make mkpayload.py resolve LC_DYLD_INFO rebase opcodes - iOS 12
-  kernels predate chained fixups, so the loader path needs that variant - then plug the
-  kernel Mach-O into mkpayload.sh; (3) implement GICv2 + arch timer (PPI 19) behind
-  ml_irq/IOCPU plus an FDT platform expert for our ADT (AIC will not be used); (4) take
+- **Next steps:** (1) add a repo CI workflow that applies
+  ports/vivo-y21l/xnu-4903-arm64-oss-build.patch and uploads the kernel (xnu-4903 links
+  locally as of 2026-11-06; the pinned blacktop path cannot build 10.14-era xnu);
+  (2) mkpayload.py LC_DYLD_INFO rebase support is done (commit 839585a); the current
+  build has no rebases at all, so plug the kernel Mach-O into mkpayload.sh / the v15
+  flash recipe and boot-test (temporary `fastboot flash boot`, confirm with user);
+  (3) implement GICv2 + arch timer (PPI 19) behind ml_irq/IOCPU plus an FDT platform
+  expert for our ADT (AIC will not be used); (4) take
   ADT shapes from a real D10AP/iOS 12 device tree (Apple artifact, keep out of git);
   (5) iOS 12 root image into userdata (destructive, confirm first). v15 stock restore
   done 2026-11-06; later optionally 50 MHz SDCC1 (GPLL0/8 + divider 1).

@@ -1,0 +1,378 @@
+diff --git a/bsd/kern/makekdebugevents.py b/bsd/kern/makekdebugevents.py
+index 73b2db4..4222e07 100755
+--- a/bsd/kern/makekdebugevents.py
++++ b/bsd/kern/makekdebugevents.py
+@@ -1,4 +1,4 @@
+-#!/usr/bin/python
++#!/usr/bin/env python3
+ #
+ # This script scans the trace.codes file, containing a mapping of event id to
+ # event name for all events, and writes to stdout a C declaration for a table
+diff --git a/config/MASTER.arm64 b/config/MASTER.arm64
+index eadc388..95e5625 100644
+--- a/config/MASTER.arm64
++++ b/config/MASTER.arm64
+@@ -73,6 +73,7 @@ machine		"arm64"						# <arm64>
+ makeoptions	OSFMK_MACHINE = "arm64"				# <mach>
+ 
+ options		COUNT_SYSCALLS		# count bsd system calls 	# <countcalls>
++options		MONOTONIC		# fixed counters (machine/monotonic.h uses MT_CORE_NFIXED)
+ options     TRASH_VFP_ON_SAVE   # <debug,trash_vfp>
+ options		ALTERNATE_DEBUGGER	# <alternate_debugger>
+ 
+diff --git a/libkern/conf/files b/libkern/conf/files
+index 5181c01..bbe594d 100644
+--- a/libkern/conf/files
++++ b/libkern/conf/files
+@@ -52,6 +52,7 @@ libkern/stdio/scanf.c					standard
+ libkern/uuid/uuid.c					standard
+ 
+ libkern/os/log.c					standard
++libkern/os/firehose_buffer_stub.c			standard
+ libkern/os/object.c					standard
+ libkern/os/internal.c					standard
+ libkern/os/refcnt.c					standard
+diff --git a/libkern/os/Makefile b/libkern/os/Makefile
+index 5db93b0..512cb08 100644
+--- a/libkern/os/Makefile
++++ b/libkern/os/Makefile
+@@ -36,7 +36,7 @@ INSTALL_KF_MI_LIST = ${KERNELFILES}
+ INSTALL_KF_MI_LCL_LIST = ${KERNELFILES} ${PRIVATE_KERNELFILES}
+ 
+ EXPORT_MI_LIST = \
+-	${KERNELFILES} ${PRIVATE_KERNELFILES} log_private.h
++	${KERNELFILES} ${PRIVATE_KERNELFILES} log_private.h firehose_buffer_private.h
+ 
+ EXPORT_MI_DIR = os
+ 
+diff --git a/libkern/os/firehose_buffer_private.h b/libkern/os/firehose_buffer_private.h
+new file mode 100644
+index 0000000..69e8555
+--- /dev/null
++++ b/libkern/os/firehose_buffer_private.h
+@@ -0,0 +1,63 @@
++/*
++ * Kernel-side subset of libdispatch's os/firehose_buffer_private.h
++ * (libdispatch-1008.250.7, OS_FIREHOSE_SPI_VERSION 20180226), which the OSS
++ * xnu-4903 drop expects but does not ship. The reserve/flush implementation
++ * lives outside xnu; for this port libkern/os/firehose_buffer_stub.c
++ * satisfies the link.
++ */
++#ifndef __FIREHOSE_BUFFER_PRIVATE__
++#define __FIREHOSE_BUFFER_PRIVATE__
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <mach/vm_types.h>
++#include <firehose/firehose_types_private.h>
++#include <firehose/tracepoint_private.h>
++
++#define OS_FIREHOSE_SPI_VERSION 20180226
++
++#define FIREHOSE_BUFFER_LIBTRACE_HEADER_SIZE	2048ul
++#define FIREHOSE_BUFFER_KERNEL_MIN_CHUNK_COUNT	16
++#define FIREHOSE_BUFFER_KERNEL_MAX_CHUNK_COUNT	64
++
++typedef struct firehose_buffer_range_s {
++	uint16_t fbr_offset;	// offset from the start of the buffer
++	uint16_t fbr_length;
++} *firehose_buffer_range_t;
++
++typedef struct firehose_chunk_s *firehose_chunk_t;
++
++/* implemented by the kernel (libkern/os/log.c, bsd/kern/subr_log.c) */
++extern void __firehose_buffer_push_to_logd(firehose_buffer_t fb, bool for_io);
++extern void __firehose_critical_region_enter(void);
++extern void __firehose_critical_region_leave(void);
++extern void __firehose_allocate(vm_offset_t *addr, vm_size_t size);
++extern uint8_t __firehose_buffer_kernel_chunk_count;
++extern uint8_t __firehose_num_kernel_io_pages;
++
++#define FIREHOSE_BUFFER_KERNEL_DEFAULT_CHUNK_COUNT FIREHOSE_BUFFER_KERNEL_MIN_CHUNK_COUNT
++#define FIREHOSE_BUFFER_KERNEL_DEFAULT_IO_PAGES    8
++
++#define FIREHOSE_BUFFER_KERNEL_CHUNK_COUNT __firehose_buffer_kernel_chunk_count
++#define FIREHOSE_BUFFER_CHUNK_PREALLOCATED_COUNT (__firehose_buffer_kernel_chunk_count - 1) // the first chunk is the header
++
++/* exported to the kernel */
++firehose_tracepoint_t
++__firehose_buffer_tracepoint_reserve(uint64_t stamp, firehose_stream_t stream,
++		uint16_t pubsize, uint16_t privsize, uint8_t **privptr);
++
++void
++__firehose_buffer_tracepoint_flush(firehose_tracepoint_t vat,
++		firehose_tracepoint_id_u vatid);
++
++firehose_buffer_t
++__firehose_buffer_create(size_t *size);
++
++void
++__firehose_merge_updates(firehose_push_reply_t update);
++
++int
++__firehose_kernel_configuration_valid(uint8_t chunk_count, uint8_t io_pages);
++
++#endif /* __FIREHOSE_BUFFER_PRIVATE__ */
+diff --git a/libkern/os/firehose_buffer_stub.c b/libkern/os/firehose_buffer_stub.c
+new file mode 100644
+index 0000000..87c77c6
+--- /dev/null
++++ b/libkern/os/firehose_buffer_stub.c
+@@ -0,0 +1,47 @@
++/*
++ * Minimal kernel-side firehose buffer implementation.
++ *
++ * Apple ships the real one outside the OSS xnu drop (libfirehose_kernel.a,
++ * built from libdispatch's src/firehose/firehose_buffer.c). Without logd on
++ * this port there is no consumer for reserved chunks, so messages fall back
++ * to firehose_boot_chunk (log.c) or are dropped, exactly as on a system
++ * where the firehose buffer could not be allocated.
++ */
++#include <firehose/firehose_types_private.h>
++#include <firehose/tracepoint_private.h>
++#include <os/firehose_buffer_private.h>
++
++firehose_tracepoint_t
++__firehose_buffer_tracepoint_reserve(uint64_t stamp __unused,
++    firehose_stream_t stream __unused, uint16_t pubsize __unused,
++    uint16_t privsize __unused, uint8_t **privptr __unused)
++{
++	return NULL;
++}
++
++void
++__firehose_buffer_tracepoint_flush(firehose_tracepoint_t vat __unused,
++    firehose_tracepoint_id_u vatid __unused)
++{
++}
++
++firehose_buffer_t
++__firehose_buffer_create(size_t *size __unused)
++{
++	return NULL;
++}
++
++void
++__firehose_merge_updates(firehose_push_reply_t update __unused)
++{
++}
++
++int
++__firehose_kernel_configuration_valid(uint8_t chunk_count, uint8_t io_pages)
++{
++	/* same predicate as libdispatch firehose_buffer.c */
++	return (((chunk_count % 4) == 0) &&
++	    (chunk_count >= FIREHOSE_BUFFER_KERNEL_MIN_CHUNK_COUNT) &&
++	    (chunk_count <= FIREHOSE_BUFFER_KERNEL_MAX_CHUNK_COUNT) &&
++	    (io_pages <= (chunk_count * 3 / 4)));
++}
+diff --git a/makedefs/MakeInc.cmd b/makedefs/MakeInc.cmd
+index 3f6f713..b063758 100644
+--- a/makedefs/MakeInc.cmd
++++ b/makedefs/MakeInc.cmd
+@@ -167,6 +167,7 @@ BASENAME = /usr/bin/basename
+ DIRNAME = /usr/bin/dirname
+ TR = /usr/bin/tr
+ TOUCH = /usr/bin/touch
++PYTHON ?= python3
+ SLEEP = /bin/sleep
+ AWK = /usr/bin/awk
+ SED = /usr/bin/sed
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index de10f20..34bf248 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -614,7 +614,9 @@ LDFLAGS_KERNEL_EXPORTS   =   \
+ # Default runtime libraries to be linked with the kernel
+ #
+ LD_KERNEL_LIBS	   = -lcc_kext
+-LD_KERNEL_ARCHIVES = $(LDFLAGS_KERNEL_SDK) -lfirehose_kernel
++# OSS port: Apple's libfirehose_kernel.a is not published; the two kernel
++# entry points it provides are stubbed in libkern/os/firehose_buffer_stub.c.
++LD_KERNEL_ARCHIVES = $(LDFLAGS_KERNEL_SDK)
+ 
+ #
+ # DTrace support
+diff --git a/makedefs/genassym_extract.py b/makedefs/genassym_extract.py
+new file mode 100644
+index 0000000..e9ba582
+--- /dev/null
++++ b/makedefs/genassym_extract.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python3
++"""Extract DECLARE() values from clang -S output of genassym.c.
++
++Replaces the historical sed pipeline, which only understands .ascii "N".
++Modern clang folds a single-character .ascii into .byte <ascii code>.
++"""
++import re
++import sys
++
++LABEL = re.compile(r'^\s*DEFINITION__define__([A-Za-z0-9_]+):\s*(.*)$')
++ASCII = re.compile(r'\.ascii\s+"([^"]*)"')
++BYTE = re.compile(r'\.byte\s+(\d+)\s*$')
++
++
++def main():
++    lines = open(sys.argv[1], 'r', errors='replace').read().splitlines()
++    out = []
++    i = 0
++    while i < len(lines):
++        m = LABEL.match(lines[i])
++        if not m:
++            i += 1
++            continue
++        name, rest = m.group(1), m.group(2)
++        if not rest.strip() and i + 1 < len(lines):
++            rest = lines[i + 1]
++            i += 1
++        i += 1
++        value = None
++        a = ASCII.search(rest)
++        if a:
++            s = a.group(1).strip().lstrip('$#')
++            if s:
++                value = int(s)
++        else:
++            b = BYTE.search(rest)
++            if b and 48 <= int(b.group(1)) <= 57:
++                value = int(b.group(1)) - 48
++        if value is None:
++            sys.stderr.write('genassym: cannot parse %s: %r\n' % (name, rest))
++            continue
++        out.append('#define %s %d' % (name, value))
++        out.append('#define %s_NUM %d' % (name, value))
++    sys.stdout.write('\n'.join(out) + '\n')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/osfmk/arm64/locore.s b/osfmk/arm64/locore.s
+index 6a8d109..422d367 100644
+--- a/osfmk/arm64/locore.s
++++ b/osfmk/arm64/locore.s
+@@ -190,9 +190,12 @@
+ 	ldr		x18, [x18, CPU_EXC_VECTORS]
+ 
+ 	/*
+-	 * Get the handler for this exception and jump to it.
++	 * Get the handler for this exception and jump to it.  Entries are
++	 * 32-bit offsets relative to the table, so that the table needs no
++	 * text relocation (modern ld64 rejects those).
+ 	 */
+-	ldr		x18, [x18, #($1 << 3)]
++	ldr		w16, [x18, #($1 << 3)]
++	add		x18, x18, w16, sxtw
+ 	br		x18
+ #else
+ 	b		$0
+@@ -204,19 +207,19 @@
+ 	.align 3
+ 	.globl EXT(exc_vectors_table)
+ LEXT(exc_vectors_table)
+-	/* Table of exception handlers. */
+-	.quad Lel1_sp0_synchronous_vector_long
+-	.quad Lel1_sp0_irq_vector_long
+-	.quad Lel1_sp0_fiq_vector_long
+-	.quad Lel1_sp0_serror_vector_long
+-	.quad Lel1_sp1_synchronous_vector_long
+-	.quad Lel1_sp1_irq_vector_long
+-	.quad Lel1_sp1_fiq_vector_long
+-	.quad Lel1_sp1_serror_vector_long
+-	.quad Lel0_synchronous_vector_64_long
+-	.quad Lel0_irq_vector_64_long
+-	.quad Lel0_fiq_vector_64_long
+-	.quad Lel0_serror_vector_64_long
++	/* Table of exception handlers, relative to the table base. */
++	.long Lel1_sp0_synchronous_vector_long - EXT(exc_vectors_table)
++	.long Lel1_sp0_irq_vector_long - EXT(exc_vectors_table)
++	.long Lel1_sp0_fiq_vector_long - EXT(exc_vectors_table)
++	.long Lel1_sp0_serror_vector_long - EXT(exc_vectors_table)
++	.long Lel1_sp1_synchronous_vector_long - EXT(exc_vectors_table)
++	.long Lel1_sp1_irq_vector_long - EXT(exc_vectors_table)
++	.long Lel1_sp1_fiq_vector_long - EXT(exc_vectors_table)
++	.long Lel1_sp1_serror_vector_long - EXT(exc_vectors_table)
++	.long Lel0_synchronous_vector_64_long - EXT(exc_vectors_table)
++	.long Lel0_irq_vector_64_long - EXT(exc_vectors_table)
++	.long Lel0_fiq_vector_64_long - EXT(exc_vectors_table)
++	.long Lel0_serror_vector_64_long - EXT(exc_vectors_table)
+ #endif /* __ARM_KERNEL_PROTECT__ */
+ 
+ 	.text
+diff --git a/osfmk/conf/Makefile.template b/osfmk/conf/Makefile.template
+index d296cb6..d9d5953 100644
+--- a/osfmk/conf/Makefile.template
++++ b/osfmk/conf/Makefile.template
+@@ -166,7 +166,7 @@ genassym.o: $(SOURCE_DIR)/$(COMPONENT)/$(GENASSYM_LOCATION)/genassym.c
+ 	$(_v)${GENASSYM_KCC} ${CFLAGS} ${CFLAGS_NOLTO_FLAG} -MD -S -o ${@} ${INCFLAGS} $<
+ 
+ assym.s: genassym.o
+-	$(_v)sed -e '/^[[:space:]]*DEFINITION__define__/!d;{N;s/\n//;}' -e 's/^[[:space:]]*DEFINITION__define__\([^:]*\):.*ascii.*\"[\$$]*\([-0-9\#]*\)\".*$$/#define \1 \2/' -e 'p'  -e 's/#//2' -e 's/^[[:space:]]*#define \([A-Za-z0-9_]*\)[[:space:]]*[\$$#]*\([-0-9]*\).*$$/#define \1_NUM \2/' genassym.o > $@
++	$(_v)python3 $(SRCROOT)/makedefs/genassym_extract.py genassym.o > $@
+ 
+ ${SOBJS}: assym.s
+ 
+diff --git a/tools/lldbmacros/core/syntax_checker.py b/tools/lldbmacros/core/syntax_checker.py
+index 02ec68e..2a02211 100755
+--- a/tools/lldbmacros/core/syntax_checker.py
++++ b/tools/lldbmacros/core/syntax_checker.py
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env python
++#!/usr/bin/env python3
+ 
+ helpdoc = """
+ A simple utility that verifies the syntax for python scripts.
+@@ -6,7 +6,7 @@ The checks it does are :
+   * Check for 'tab' characters in .py files
+   * Compile errors in py sources
+ Usage:
+-  python syntax_checker.py <python_source_file> [<python_source_file> ..] 
++  python3 syntax_checker.py <python_source_file> [<python_source_file> ..] 
+ """
+ import py_compile
+ import sys
+@@ -17,15 +17,15 @@ tabs_search_rex = re.compile("^\s*\t+",re.MULTILINE|re.DOTALL)
+ 
+ if __name__ == "__main__":
+     if len(sys.argv) < 2:
+-        print >>sys.stderr, "Error: Unknown arguments"
+-        print helpdoc
++        print("Error: Unknown arguments", file=sys.stderr)
++        print(helpdoc)
+         sys.exit(1)
+     for fname in sys.argv[1:]:
+         if not os.path.exists(fname):
+-            print >>sys.stderr, "Error: Cannot recognize %s as a file" % fname
++            print("Error: Cannot recognize %s as a file" % fname, file=sys.stderr)
+             sys.exit(1)
+         if fname.split('.')[-1] != 'py':
+-            print "Note: %s is not a valid python file. Skipping." % fname
++            print("Note: %s is not a valid python file. Skipping." % fname)
+             continue
+         fh = open(fname)
+         strdata = fh.readlines()
+@@ -34,18 +34,17 @@ if __name__ == "__main__":
+         for linedata in strdata:
+             lineno += 1
+             if len(tabs_search_rex.findall(linedata)) > 0 :
+-                print >>sys.stderr, "Error: Found a TAB character at %s:%d" % (fname, lineno)
++                print("Error: Found a TAB character at %s:%d" % (fname, lineno), file=sys.stderr)
+                 tab_check_status = False
+         if tab_check_status == False:
+-            print >>sys.stderr, "Error: Syntax check failed. Please fix the errors and try again."
++            print("Error: Syntax check failed. Please fix the errors and try again.", file=sys.stderr)
+             sys.exit(1)
+         #now check for error in compilation
+         try:
+             compile_result = py_compile.compile(fname, cfile="/dev/null", doraise=True)
+         except py_compile.PyCompileError as exc:
+-            print >>sys.stderr, str(exc)
+-            print >>sys.stderr, "Error: Compilation failed. Please fix the errors and try again."
++            print(str(exc), file=sys.stderr)
++            print("Error: Compilation failed. Please fix the errors and try again.", file=sys.stderr)
+             sys.exit(1)
+-        print "Success: Checked %s. No syntax errors found." % fname
++        print("Success: Checked %s. No syntax errors found." % fname)
+     sys.exit(0)
+-
