@@ -134,10 +134,13 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   0x28012+0x400, rpm/tz/hyp/aboot ~0x400 each, boot 0x3ac60+0x20000, recovery
   0x5ac60+0x20000, devinfo 0x9ac60+0x4000, system 0x9ec60+0x600000, cache 0x6a0000+0x4b000,
   persist 0x6eb000+0x10000, misc/keystore/config/oem, userdata 0x72b000+0x15f3fdf
-  (~11.0 GB). Boot partition still holds v7b; stock restore pending. v8
-  (`vivo-test8-boot.img` sha256 d8d2f85a...32f5, built, NOT flashed) logs EXT_CSD rev /
-  SEC_COUNT / bytes 176..191, attempts the 8-bit switch unconditionally and unwinds one
-  step at a time (1-bit while keeping HS, then 1-bit SDR) with an LBA0 verify after each.
+  (~11.0 GB). v8 (`vivo-test8-boot.img` sha256 d8d2f85a...32f5) **forced the 8-bit switch
+  (CMD6 183=2) and the LBA0 verify passed: `fast ok 5`, HOST_CTRL1 0x34, and the 9-block
+  GPT read ran over the 8-bit HS 25 MHz link. EXT_CSD on this card: rev=8,
+  DEVICE_TYPE=0x1f57, SEC_COUNT=0x1d1f000 (14.56 GiB; userdata ends 0x21 sectors below),
+  HS_TIMING=0 before the switch; BUS_WIDTH still reads 0x00 - bogus on this hynix part,
+  stock LK ignores it too.** Bytes 176..191 as words: 38000000 00000000 00000001 00000000.
+  Boot partition still holds v8; stock restore pending (needs another fastboot trip).
 - **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
   iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
   xnu-8796 + iOS 12 userland vs port xnu-4903).
@@ -146,9 +149,8 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) v8: dump EXT_CSD bytes 176..201 and SEC_COUNT, attempt the 8-bit
-  switch unconditionally (verify + fallback to 1-bit), then restore the stock boot.img;
-  later consider 50 MHz (GPLL0/8 + divider 1); (2) GICv2 + arch timer +
+- **Next steps:** (1) restore the stock boot.img (needs fastboot); later consider 50 MHz
+  (GPLL0/8 + divider 1); (2) GICv2 + arch timer +
   exception handling when IRQs are needed (until then IRQs stay masked and the GIC off);
   (3) sweet-style payload pipeline (mkpayload) for this device; (4) msm8916 ADT generator;
   (5) iOS 12 root image into userdata (destructive, confirm first).
