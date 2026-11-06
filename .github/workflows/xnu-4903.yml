@@ -1,0 +1,71 @@
+name: xnu-4903
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "ports/vivo-y21l/xnu-4903-arm64-oss-build.patch"
+      - ".github/workflows/xnu-4903.yml"
+
+concurrency:
+  group: xnu-4903-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  XNU_REPO: https://github.com/apple-oss-distributions/xnu
+  XNU_TAG: xnu-4903.270.47
+
+jobs:
+  build:
+    # ios-sweet reference used macos-14; any Xcode with a modern ld64 works
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch xnu-4903 and apply the OSS-build patch
+        run: |
+          git clone -q --depth 1 --branch "$XNU_TAG" "$XNU_REPO" xnu-4903
+          test "$(git -C xnu-4903 rev-parse HEAD)" = 494ffe1c29d37ca720c37328feb83069c9641b67
+          git -C xnu-4903 apply "$GITHUB_WORKSPACE/ports/vivo-y21l/xnu-4903-arm64-oss-build.patch"
+          # the OSS tree expects these to exist and they are not in git
+          mkdir -p xnu-4903/BUILD/obj/EXPORT_HDRS/libsa xnu-4903/stage/usr/local/include/kernel
+
+      - name: Build kernel
+        working-directory: xnu-4903
+        run: |
+          make ARCH_CONFIGS=ARM64 KERNEL_CONFIGS=DEVELOPMENT \
+            MACHINE_CONFIGS=T7000 SDKROOT=macosx \
+            ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 \
+            INCFLAGS_SDK="-I$PWD/stage/usr/local/include/kernel" \
+            BUILD_WERROR=0 CTFCONVERT=/usr/bin/true CTFMERGE=/usr/bin/true \
+            -j"$(sysctl -n hw.ncpu)" -k
+
+      - name: Package
+        if: always()
+        run: |
+          dir=xnu-4903/BUILD/obj/DEVELOPMENT_ARM64_T7000
+          mkdir -p out
+          find "$dir" -maxdepth 1 -name 'kernel.*' ! -name '*.dSYM' -exec cp {} out/ \; 2>/dev/null || true
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) 2>/dev/null || true
+          ls -la out
+          file out/kernel.development.t7000 || true
+          otool -l out/kernel.development.t7000 2>/dev/null | grep -E 'segname __|vmaddr' | head -40 || true
+
+      - name: Payload smoke test
+        run: |
+          python3 ports/vivo-y21l/mkadt.py out/vivo.adt
+          python3 tools/mkpayload.py out/kernel.development.t7000 out/vivo.adt out/payload.bin \
+            --cmdline "debug=0x8 serial=3 keepsyms=1"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-4903-kernel
+          path: |
+            out/kernel.*
+            out/SHA256SUMS
+            out/payload.bin
+          if-no-files-found: warn
+          retention-days: 7
