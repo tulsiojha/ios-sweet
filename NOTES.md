@@ -100,6 +100,16 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   (`fdt_dump`, BE reads, token walk, logs model/bootargs//memory reg). Image
   `device-info/vivo-stock/vivo-test6c-boot.img` sha256 40804d79...f250. Stock restored,
   Android 5.1.1 back (adb online).
+- **BLOCK LAYER (2026-11-06, stage0 v7, built, NOT yet flashed):** after the v6c probe the
+  payload reads EXT_CSD (CMD8, single-block ADMA2), tries 8-bit bus (CMD6 idx183=2, then
+  HOST_CTRL1 bit5) and high speed (idx185=1, HOST_CTRL1 bit2), raises SDCC1 from 390 kHz to
+  25 MHz (divider N=1, `sdcc_set_clock`) and verifies with a fresh LBA0 read; on mismatch it
+  falls back to 1-bit SDR at 390 kHz (185=0, 183=1) and verifies again. CMD6 uses the R1b
+  response type and is synchronised with CMD13 until the card is back in TRAN. GPT: header at
+  LBA1, entry array (128x128 B = 32 blocks) read with CMD23 + multi-block CMD18 through a
+  chunked ADMA2 table, listing name/first LBA/block count per used partition. Replay gains
+  `fast=%x` (1 = 8-bit, 4 = 25 MHz). Image `device-info/vivo-stock/vivo-test7-boot.img`
+  sha256 c3fd6b54...0965b. Hardware test pending.
 - **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
   iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
   xnu-8796 + iOS 12 userland vs port xnu-4903).
@@ -108,11 +118,11 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) SDHCI block layer: multi-block CMD18/CMD23, then 8-bit/HS timing,
-  and GPT parsing (LBA2 entries) so the payload can read named partitions; (2) GICv2 +
-  arch timer + exception handling when IRQs are needed (until then IRQs stay masked and
-  the GIC off); (3) sweet-style payload pipeline (mkpayload) for this device; (4) msm8916
-  ADT generator; (5) iOS 12 root image into userdata (destructive, confirm first).
+- **Next steps:** (1) flash stage0 v7 and check the EXT_CSD decode, the 8-bit/HS switch,
+  the fast verify and the GPT partition list (fix whatever fails); (2) GICv2 + arch timer +
+  exception handling when IRQs are needed (until then IRQs stay masked and the GIC off);
+  (3) sweet-style payload pipeline (mkpayload) for this device; (4) msm8916 ADT generator;
+  (5) iOS 12 root image into userdata (destructive, confirm first).
   BLSP1 UART2 stays a fallback (GCC clocks needed, pins probably not exposed). Reference
   for the SCM path: lk2nd `platform/msm_shared/scm.c` + `app/aboot/aboot.c` (cloned at
   /tmp/lk2nd, not in git).

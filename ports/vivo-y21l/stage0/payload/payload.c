@@ -18,7 +18,11 @@
  * The eMMC probe re-initializes SDCC1 from scratch (LK shuts it down to
  * put the card to sleep before the kernel handoff), walks CMD0/1/2/3/9/7/16
  * at 400 kHz and reads LBA0/LBA1 through ADMA2, logging the MBR/GPT
- * signatures. Everything is polled; the GIC stays off.
+ * signatures. It then reads EXT_CSD (CMD8), switches the card to 8-bit
+ * bus + high speed (CMD6), raises SDCC1 to 25 MHz, verifies with a fresh
+ * LBA0 read (falling back to 1-bit/390 kHz on failure) and finally reads
+ * the GPT entry array with CMD23 + a multi-block CMD18, listing the
+ * named partitions. Everything is polled; the GIC stays off.
  */
 
 #include <stdarg.h>
@@ -948,9 +952,13 @@ struct adma2_desc {
 	u32 addr;
 };
 
-static struct adma2_desc g_adma __attribute__((aligned(64)));
+static struct adma2_desc g_adma[8] __attribute__((aligned(64)));
 static u8 g_emmc_blk[1024] __attribute__((aligned(64)));
+static u8 g_ext_csd[512] __attribute__((aligned(64)));
+static u8 g_gpt_hdr[512] __attribute__((aligned(64)));
+static u8 g_gpt_ent[16384] __attribute__((aligned(64)));
 static u32 g_sd_resp[4];
+static u32 g_emmc_fast;		/* 1 = 8-bit, 2 = high speed, 4 = 25 MHz */
 
 static u32 wait8_clear(u64 addr, u8 mask, u32 ms)
 {
@@ -1013,7 +1021,8 @@ static u32 sdcc_wait_idle(u32 ms)
 
 /*
  * kind: 0 = no response, 1 = R2 (136 bit, CRC),
- *       2 = 48 bit with CRC+index checks (R1/R6/R7), 3 = 48 bit R3
+ *       2 = 48 bit with CRC+index checks (R1/R6/R7), 3 = 48 bit R3,
+ *       4 = 48 bit with busy (R1b, CMD6)
  */
 static u32 sdcc_cmd(u32 idx, u32 arg, u32 kind)
 {
@@ -1034,6 +1043,8 @@ static u32 sdcc_cmd(u32 idx, u32 arg, u32 kind)
 		flags = 2 | (1u << 3) | (1u << 4);
 	else if (kind == 3)
 		flags = 2;
+	else if (kind == 4)
+		flags = 3 | (1u << 3) | (1u << 4);
 	else
 		flags = 0;
 	wr16(SDHCI_BASE + SDHCI_CMD, (u16)((idx << 8) | flags));
@@ -1080,7 +1091,32 @@ timeout:
 	return 0x300;
 }
 
-static u32 sdcc_read_block(u32 lba, void *buf)
+/* chunked ADMA2 table, at most 8 x 32 KiB */
+static u32 sdcc_adma_setup(void *buf, u32 bytes)
+{
+	u32 left = bytes, i = 0, len;
+	u8 *p = buf;
+
+	while (left) {
+		len = left > 32768u ? 32768u : left;
+		if (i == 8)
+			return 1;
+		g_adma[i].attr = (u16)(0x0021 | (left == len ? 0x0002 : 0));
+		g_adma[i].len = (u16)len;
+		g_adma[i].addr = (u32)(u64)p;
+		left -= len;
+		p += len;
+		i++;
+	}
+	barrier();
+	return 0;
+}
+
+/*
+ * Data read: idx 17 (single block, arg = lba) or 18 (multi block,
+ * arg = lba, preceded by CMD23 so the card stops after n blocks).
+ */
+static u32 sdcc_read_data(u32 idx, u32 arg, void *buf, u32 nblk)
 {
 	u32 st = 0, s;
 	volatile u32 n;
@@ -1091,19 +1127,28 @@ static u32 sdcc_read_block(u32 lba, void *buf)
 
 	wr16(SDHCI_BASE + SDHCI_NRML_INT_STS, 0xffff);
 	wr16(SDHCI_BASE + SDHCI_ERR_INT_STS, 0xffff);
-	g_adma.attr = 0x0023;		/* VALID | END | ACT=tran */
-	g_adma.len = 512;
-	g_adma.addr = (u32)(u64)buf;
-	barrier();
+	if (sdcc_adma_setup(buf, nblk * 512))
+		return 0x101;
 
 	wr(SDHCI_BASE + SDHCI_ADMA_ADDR, (u32)(u64)&g_adma);
 	wr16(SDHCI_BASE + SDHCI_BLKSZ, 512);
-	wr16(SDHCI_BASE + SDHCI_BLK_CNT, 1);
+	wr16(SDHCI_BASE + SDHCI_BLK_CNT, (u16)nblk);
 	wr8(SDHCI_BASE + SDHCI_TIMEOUT_REG, 0x0f);
-	wr(SDHCI_BASE + SDHCI_ARGUMENT, lba);
-	wr16(SDHCI_BASE + SDHCI_TRANS_MODE, 0x0011);	/* DMA | read, single */
+
+	if (nblk > 1) {
+		u32 r = sdcc_cmd(23, nblk, 2);
+
+		if (r) {
+			log_printf("emmc: cmd23 %u\n", r);
+			return 0x400 | r;
+		}
+	}
+
+	wr(SDHCI_BASE + SDHCI_ARGUMENT, arg);
+	wr16(SDHCI_BASE + SDHCI_TRANS_MODE,
+	     (u16)(nblk > 1 ? 0x0033 : 0x0011));	/* DMA | count | read | multi */
 	wr16(SDHCI_BASE + SDHCI_CMD,
-	     (u16)((17 << 8) | 2 | (1u << 3) | (1u << 4) | (1u << 5)));
+	     (u16)((idx << 8) | 2 | (1u << 3) | (1u << 4) | (1u << 5)));
 
 	s = ticks();
 	n = 2000 * g_spin_budget;
@@ -1136,6 +1181,187 @@ static u32 sdcc_read_block(u32 lba, void *buf)
 		return 0x300;
 	}
 	return 0;
+}
+
+static u32 sdcc_read_block(u32 lba, void *buf)
+{
+	return sdcc_read_data(17, lba, buf, 1);
+}
+
+/* base clock 50 MHz, sclk = 50 MHz / (2 * div) */
+static void sdcc_set_clock(u32 div)
+{
+	u32 s;
+	volatile u32 n;
+
+	wr16(SDHCI_BASE + SDHCI_CLK_CTRL, 0);
+	n = g_spin_budget;
+	while (n--)
+		;
+	wr16(SDHCI_BASE + SDHCI_CLK_CTRL, (u16)((div << 8) | 1u));
+	s = ticks();
+	n = 100 * g_spin_budget;
+	while (!(rd16(SDHCI_BASE + SDHCI_CLK_CTRL) & 2)) {
+		if (g_tick_ms) {
+			if (elapsed_ms(s) >= 100)
+				break;
+		} else if (!n) {
+			break;
+		} else {
+			n--;
+		}
+	}
+	wr16(SDHCI_BASE + SDHCI_CLK_CTRL,
+	     (u16)(rd16(SDHCI_BASE + SDHCI_CLK_CTRL) | 4));
+}
+
+/* CMD6 write-byte switch, then CMD13 until the card is back in TRAN */
+static u32 emmc_switch(u32 index, u32 value)
+{
+	u32 r, i, st = 0;
+
+	r = sdcc_cmd(6, (3u << 24) | (index << 16) | (value << 8), 4);
+	if (r) {
+		log_printf("emmc: cmd6 idx=%u val=%u -> %u\n", index, value, r);
+		return r;
+	}
+	sdcc_wait_idle(500);
+	for (i = 0; i < 20; i++) {
+		r = sdcc_cmd(13, 2u << 16, 2);
+		if (!r) {
+			st = (g_sd_resp[0] >> 9) & 0xfu;
+			if (st == 4)
+				return 0;
+		}
+		delay_ms(1);
+	}
+	log_printf("emmc: switch idx=%u state=%x r=%u\n", index, st, r);
+	return 0x500 | st;
+}
+
+/*
+ * Read EXT_CSD (CMD8), try 8-bit bus + high speed, raise the clock to
+ * 25 MHz and verify with a fresh LBA0 read. On failure fall back to
+ * 1-bit SDR at 390 kHz and verify again.
+ */
+static void emmc_fast(u8 *blk)
+{
+	u32 r, widths, dev_type;
+
+	r = sdcc_read_data(8, 0, g_ext_csd, 1);
+	if (r) {
+		log_printf("emmc: ext_csd %u\n", r);
+		return;
+	}
+	widths = g_ext_csd[183];
+	dev_type = g_ext_csd[196] | (g_ext_csd[197] << 8);
+	log_printf("emmc: bus_w=%x dev_type=%x hs_timing=%x\n",
+		   widths, dev_type, g_ext_csd[185]);
+
+	if (widths & 4) {		/* bit2: 8-bit supported */
+		r = emmc_switch(183, 2);
+		log_printf("emmc: 8bit %u\n", r);
+		if (!r) {
+			wr8(SDHCI_BASE + SDHCI_HOST_CTRL1,
+			    (u8)((rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) & ~2u) | 0x20u));
+			g_emmc_fast |= 1;
+		}
+	}
+
+	if (!r && (dev_type & 6)) {	/* any HS timing bit */
+		r = emmc_switch(185, 1);
+		log_printf("emmc: hs %u\n", r);
+		if (!r) {
+			wr8(SDHCI_BASE + SDHCI_HOST_CTRL1,
+			    (u8)(rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) | 4u));
+			sdcc_set_clock(1);
+			g_emmc_fast |= 4;
+			log_printf("emmc: clk ctl=%x host1=%x\n",
+				   rd16(SDHCI_BASE + SDHCI_CLK_CTRL),
+				   rd8(SDHCI_BASE + SDHCI_HOST_CTRL1));
+		}
+	}
+
+	r = sdcc_read_block(0, blk);
+	if (!r && blk[510] == 0x55 && blk[511] == 0xaa) {
+		log_printf("emmc: fast ok %x\n", g_emmc_fast);
+		return;
+	}
+	log_printf("emmc: fast verify failed %u\n", r);
+
+	/* back to 1-bit SDR at 390 kHz */
+	sdcc_set_clock(64);
+	if (g_emmc_fast & 4)
+		emmc_switch(185, 0);
+	if (g_emmc_fast & 1)
+		emmc_switch(183, 1);
+	wr8(SDHCI_BASE + SDHCI_HOST_CTRL1,
+	    (u8)((rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) & ~(0x22u)) | 0x10u));
+	g_emmc_fast = 0;
+	r = sdcc_read_block(0, blk);
+	log_printf("emmc: slow retry %u sig=%x\n",
+		   r, blk[510] | (blk[511] << 8));
+}
+
+/* read the GPT entry array (CMD23 + CMD18) and list used partitions */
+static void gpt_scan(void)
+{
+	u32 r, i, n_ent, e_sz, blocks, count = 0;
+	u64 ent_lba;
+	u32 *w = (u32 *)g_gpt_hdr;
+
+	r = sdcc_read_block(1, g_gpt_hdr);
+	if (r) {
+		log_printf("gpt: hdr read %u\n", r);
+		return;
+	}
+	if (w[0] != 0x20494645u || w[1] != 0x54524150u) {
+		log_puts("gpt: bad hdr\n");
+		return;
+	}
+	ent_lba = (u64)w[18] | ((u64)w[19] << 32);
+	n_ent = w[20];
+	e_sz = w[21];
+	log_printf("gpt: entries lba=%lx n=%u esz=%u\n", ent_lba, n_ent, e_sz);
+	if (!n_ent || e_sz != 128) {
+		log_puts("gpt: unexpected layout\n");
+		return;
+	}
+	if (n_ent > sizeof(g_gpt_ent) / e_sz)
+		n_ent = sizeof(g_gpt_ent) / e_sz;
+	if (ent_lba > 0xffffffffull) {
+		log_puts("gpt: entries beyond 32-bit lba\n");
+		return;
+	}
+
+	blocks = (n_ent * e_sz + 511) / 512;
+	r = sdcc_read_data(18, (u32)ent_lba, g_gpt_ent, blocks);
+	log_printf("gpt: read %u blocks -> %u\n", blocks, r);
+	if (r)
+		return;
+
+	for (i = 0; i < n_ent; i++) {
+		u8 *e = g_gpt_ent + i * e_sz;
+		u32 j, first, last, nz = 0;
+		char name[25];
+
+		for (j = 0; j < 16; j++)
+			nz |= e[j];
+		if (!nz)
+			continue;
+		first = *(u32 *)(e + 32);
+		last = *(u32 *)(e + 40);
+		for (j = 0; j < 24 && e[56 + j * 2]; j++) {
+			u8 c = e[56 + j * 2];	/* UTF-16LE, ASCII in the low byte */
+
+			name[j] = (c >= 0x20 && c <= 0x7e) ? c : '.';
+		}
+		name[j] = 0;
+		log_printf("gpt: %u %s %x+%x\n", i, name, first,
+			   last - first + 1);
+		count++;
+	}
+	log_printf("gpt: %u partitions\n", count);
 }
 
 static void sdcc_host_init(void)
@@ -1205,31 +1431,10 @@ static void sdcc_host_init(void)
 	    (u8)((rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) & ~0x20u) | (1u << 4)));
 
 	/* ~390 kHz: 50 MHz / (2 * 64) */
-	{
-		u16 val = (u16)((64u << 8) | 1u);
-
-		wr16(SDHCI_BASE + SDHCI_CLK_CTRL, val);
-		{
-			u32 s = ticks();
-			volatile u32 n = 100 * g_spin_budget;
-
-			while (!(rd16(SDHCI_BASE + SDHCI_CLK_CTRL) & 2)) {
-				if (g_tick_ms) {
-					if (elapsed_ms(s) >= 100)
-						break;
-				} else if (!n) {
-					break;
-				} else {
-					n--;
-				}
-			}
-		}
-		val = rd16(SDHCI_BASE + SDHCI_CLK_CTRL);
-		wr16(SDHCI_BASE + SDHCI_CLK_CTRL, (u16)(val | 4));
-		log_printf("emmc: clk ctl=%x host1=%x\n",
-			   rd16(SDHCI_BASE + SDHCI_CLK_CTRL),
-			   rd8(SDHCI_BASE + SDHCI_HOST_CTRL1));
-	}
+	sdcc_set_clock(64);
+	log_printf("emmc: clk ctl=%x host1=%x\n",
+		   rd16(SDHCI_BASE + SDHCI_CLK_CTRL),
+		   rd8(SDHCI_BASE + SDHCI_HOST_CTRL1));
 
 	wr16(SDHCI_BASE + SDHCI_NRML_INT_EN, 0x000b);
 	wr16(SDHCI_BASE + SDHCI_ERR_INT_EN, 0xffff);
@@ -1346,6 +1551,9 @@ static void emmc_probe(void)
 	} else {
 		log_printf("emmc: lba1 %u\n", r);
 	}
+
+	emmc_fast(blk);
+	gpt_scan();
 	g_emmc_state = 0;
 }
 
@@ -1361,10 +1569,11 @@ static void boot_replay(void)
 	log_printf("\n-- v6 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
 		   g_boot_dtb, g_boot_dtb_ok ? "ok" : "bad",
 		   g_boot_midr, g_boot_cntfrq, g_tick_ms);
-	log_printf("-- wdt_en=%x usb=%s emmc=%s\n", g_boot_wdt_en,
+	log_printf("-- wdt_en=%x usb=%s emmc=%s fast=%x\n", g_boot_wdt_en,
 		   g_configured ? (bus_highspeed() ? "hs" : "fs") : "off",
 		   g_emmc_state == 0 ? "ok" : (g_emmc_state == 0xffff ?
-					       "not probed" : "failed"));
+					       "not probed" : "failed"),
+		   g_emmc_fast);
 }
 
 /* run once, after enumeration settled (or 10 s after attach) */
