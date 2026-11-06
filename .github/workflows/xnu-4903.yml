@@ -21,8 +21,9 @@ env:
 
 jobs:
   build:
-    # ios-sweet reference used macos-14; any Xcode with a modern ld64 works
-    runs-on: macos-14
+    # macos-14 now resolves to an arm64 configuration this repo cannot use;
+    # the Intel image is fine for a cross-compiled ARM64 kernel
+    runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
