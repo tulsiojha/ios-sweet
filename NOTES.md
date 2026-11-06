@@ -261,9 +261,12 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   entry (no reset), but with no GIC/UART/platform expert and no console we cannot see
   how far. FLASH STATE: stock boot.img RESTORED 2026-11-06 (`fastboot flash boot
   device-info/vivo-stock/boot.img`, Sending 'boot' (22087 KB) OKAY, sha256
-  51042586...35b1) and `fastboot reboot` issued; adb did not come back within 60 s
-  (USB debugging is normally off on this phone), so Android boot is user-verified
-  visually, not via adb. Next: a console/side-effect probe for xnu (UART or the
+  51042586...35b1) and `fastboot reboot` issued; the phone boots Android fine but
+  exposes NO USB device to macOS in Android mode (System Information shows nothing,
+  adb empty) even with USB debugging enabled, so the workflow is fastboot-only for
+  now (suspected charge-only cable/port contact; fastboot mode itself enumerated for
+  both flashes). Android boot is user-verified visually. Next: a console/side-effect
+  probe for xnu (UART or the
   ChipIdea device-mode USB behind ml_irq/IOCPU), then GICv2 + FDT platform expert.
   CI: `.github/workflows/xnu-4903.yml` (commit 8eedd8f) applies the patch to a fresh
   494ffe1 clone and builds on `macos-15-intel`. `macos-14` now resolves to
