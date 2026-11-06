@@ -59,6 +59,33 @@ Second target, separate from sweet. Phone serial c25ac45b; DTB copied to `vivo.d
   495b9a46...ae2d). Observations: macOS re-sends SET_LINE_CODING a few times when the tty
   opens (benign, data flows); on tty close a pending bulk-IN chunk is dropped after the 5 s
   tx3 timeout (v5 quirk - retry the chunk instead of flushing in the next build).
+- **eMMC READ VIA SDHCI WORKS (2026-11-06, stage0 v6):** after USB enumeration the payload
+  now re-initializes SDCC1 from scratch (LK puts the card to sleep and clears the HC-mode
+  bit in target_uninit), walks the eMMC init chain at ~391 kHz and reads LBA0/LBA1 through
+  ADMA2; all steps are logged on the CDC-ACM console. Implementation in `payload.c`
+  (sdcc_* / emmc_probe): GCC SDCC1 AHB CBCR 0x184201C, apps RCG CMD/CFG 0x1842004/08,
+  M/N/D 0x184200C/10/14 = GPLL0/16 (800/16 = 50 MHz, CFG 0x11F, no MND); no SDCC1 BCR
+  write needed (reads 0); SDHCI divisor 64 -> 390.6 kHz (CLK_CTRL 0x4005). Host bring-up
+  mirrors LK sdhci_msm/sdhci: vendor 0x10C = 0xA1C, HC mode 0x7824078 = bit0|bit13,
+  reset via 0x2F, power-IRQ poll/ack (status 0xDC, clear 0xE4, ctl 0xE8, mask 0xE0 = 0xF),
+  MCI version 0x50, caps override 0x11C (caps|1<<26) when major>=1 and minor not
+  0x11/0x12, PWR_CTRL 0x29, 1-bit bus, ADMA2 32-bit (HOST_CTRL1 bit4), interrupt enables
+  0x000B/0xFFFF. Card chain: CMD0; CMD1 arg 0x40FF8000 -> OCR 0xC0FF8080 in 2 tries;
+  CMD2 (CID mid=0xC4 oid=0x5B14); CMD3 arg 2<<16 (R6 resp 0x500); CMD9; CMD7 (resp
+  0x700); CMD16 512 (resp 0x900); CMD17 ADMA2 read of LBA0 (MBR sig 0xAA55, partition
+  type 0xEE) and LBA1 ("EFI PART" = 0x20494645 0x54524150, so the disk is GPT). Observed
+  caps1 0x302DC8B2 (voltage bits 24-26 zero -> PWR_CTRL 0x01), caps2 0x00008007, core
+  version 0x1000002E; the power-IRQ status never asserted (eMMC rails are always-on per
+  the DTS). Log fixes in the same build: a stalled bulk-IN chunk is retried (flush, clear
+  TXS, re-prime the same buffer) instead of dropped after 5 s, and a boot-info line is
+  replayed on SET_LINE_CODING, throttled to 5 s (macOS sends SET_LINE_CODING ~8 times
+  around tty open; data path unaffected). Bug found and fixed in v6b: the FDT magic is
+  big-endian, so a little-endian u32 read is 0xEDFE0DD0, not 0xD00DFEED (v6 printed
+  "magic bad" for a valid DTB); x0 = 0x81E00000 is r2/tags_addr from LK's 32-bit entry
+  (stock boot header), where DEVICE_TREE LK memmoves the matched DTB (to be confirmed on
+  the next flash). Images: v6 `vivo-test6-boot.img` sha256 4deb416b...e665b6 (flashed for
+  this test), v6b `vivo-test6b-boot.img` sha256 0035c5e8...ca782 (built, not yet flashed).
+  Stock boot.img restored, Android 5.1.1 back (adb c25ac45b).
 - **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
   iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
   xnu-8796 + iOS 12 userland vs port xnu-4903).
@@ -67,13 +94,16 @@ Second target, separate from sweet. Phone serial c25ac45b; DTB copied to `vivo.d
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) A64 payload improvements: keep the pending bulk-IN chunk across host
-  read stalls (v5 flushes it after 5 s) and keep a boot-info blob for replay; add GICv2 +
-  timer + exception handling (IRQs stay masked and the GIC off until then); (2) SDHCI eMMC
-  driver (needed for the root image anyway); (3) sweet-style payload pipeline (mkpayload)
-  for this device; (4) ADT generator. BLSP1 UART2 stays a fallback (GCC clocks needed,
-  pins probably not exposed). Reference for the SCM path: lk2nd `platform/msm_shared/scm.c`
-  + `app/aboot/aboot.c` (cloned at /tmp/lk2nd, not in git).
+- **Next steps:** (1) flash v6b to confirm the dtb magic check, `gpt=yes` and the single
+  replay, and dump the FDT header at 0x81E00000 (totalsize/model) for the kernel handoff;
+  (2) SDHCI block layer: multi-block CMD18/CMD23, then 8-bit/HS timing, and GPT parsing
+  (LBA2 entries) so the payload can read the root image; (3) GICv2 + arch timer +
+  exception handling when IRQs are needed (until then IRQs stay masked and the GIC off);
+  (4) sweet-style payload pipeline (mkpayload) for this device; (5) msm8916 ADT generator;
+  (6) iOS 12 root image into userdata (destructive, confirm first). BLSP1 UART2 stays a
+  fallback (GCC clocks needed, pins probably not exposed). Reference for the SCM path:
+  lk2nd `platform/msm_shared/scm.c` + `app/aboot/aboot.c` (cloned at /tmp/lk2nd, not in
+  git).
 - This Mac session has no cross gcc + no gh CLI; kernel builds still go through the public
   repo's GitHub Actions (`dipa-studio/ios-sweet`).
 

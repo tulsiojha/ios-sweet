@@ -1,5 +1,6 @@
 /*
- * stage0 v5 AArch64 payload: polled ChipIdea USB device-mode console.
+ * stage0 v6 AArch64 payload: polled ChipIdea USB device-mode console plus
+ * an SDHCI eMMC read-only probe.
  *
  * Runs at EL1 with the MMU and caches off, entered at 0x8000a000 by the
  * ARM32 secure-monitor stub (x0 = dtb). The USB controller is driven the
@@ -10,7 +11,14 @@
  *
  * The device enumerates as a CDC-ACM serial (1209:0001) whose bulk-IN
  * endpoint streams a text log, so on the host it is just
- * /dev/tty.usbmodemXXXX and `cat` shows the log.
+ * /dev/tty.usbmodemXXXX and `cat` shows the log. A stale bulk-IN chunk is
+ * retried instead of dropped, and a boot-info line is replayed whenever
+ * the host opens the port (SET_LINE_CODING).
+ *
+ * The eMMC probe re-initializes SDCC1 from scratch (LK shuts it down to
+ * put the card to sleep before the kernel handoff), walks CMD0/1/2/3/9/7/16
+ * at 400 kHz and reads LBA0/LBA1 through ADMA2, logging the MBR/GPT
+ * signatures. Everything is polled; the GIC stays off.
  */
 
 #include <stdarg.h>
@@ -26,6 +34,10 @@ typedef unsigned long long u64;
 
 static inline u32 rd(u64 a) { return *(volatile u32 *)a; }
 static inline void wr(u64 a, u32 v) { *(volatile u32 *)a = v; }
+static inline u8 rd8(u64 a) { return *(volatile u8 *)a; }
+static inline u16 rd16(u64 a) { return *(volatile u16 *)a; }
+static inline void wr8(u64 a, u8 v) { *(volatile u8 *)a = v; }
+static inline void wr16(u64 a, u16 v) { *(volatile u16 *)a = v; }
 static inline void barrier(void) { __asm__ volatile("dsb sy" ::: "memory"); }
 
 void *memcpy(void *dst, const void *src, unsigned long n)
@@ -333,6 +345,14 @@ static u32 g_configured;
 static u32 g_config_value;
 static u32 g_tx_busy;
 static u32 g_tx_start;
+static u32 g_tx_len;
+
+/* kept for the boot-info replay on host open */
+static u64 g_boot_dtb, g_boot_cntfrq;
+static u32 g_boot_dtb_ok, g_boot_midr, g_boot_wdt_en;
+static u32 g_emmc_state = 0xffff;	/* 0 = lba0 read ok */
+
+static void boot_replay(void);
 
 enum {
 	EP0_IDLE,
@@ -534,6 +554,10 @@ static void usb_handle_setup(void)
 				ep0_recv(len);
 			else
 				ep0_status_in();
+			/* SET_LINE_CODING means a tty was just opened: replay
+			 * the boot facts in case the early log was lost. */
+			if (req == 0x20)
+				boot_replay();
 		} else if (req == 0x21) {
 			static const u8 lc[7] = {
 				0x00, 0xc2, 0x01, 0x00, 0x00, 0x00, 0x08
@@ -705,19 +729,32 @@ static void usb_pump(void)
 		return;
 	if (g_tx_busy) {
 		if (elapsed_ms(g_tx_start) > 5000) {
+			static u32 retries;
+			u32 c;
+
+			/* The host may simply not be reading yet (tty closed).
+			 * Flush the stuck transfer but keep the chunk: clear
+			 * the endpoint status and prime the very same data
+			 * again instead of dropping it. */
 			wr(USB_BASE + USB_ENDPTFLUSH, EPT_TX(3));
 			wait_clear(USB_BASE + USB_ENDPTFLUSH, EPT_TX(3), 100);
-			if (rd(USB_BASE + USB_ENDPTCTRL(3)) & CTRL_TXS)
-				wr(USB_BASE + USB_ENDPTCTRL(3),
-				   rd(USB_BASE + USB_ENDPTCTRL(3)));
-			g_tx_busy = 0;
-			log_printf("usb: tx3 timeout, flushed\n");
+			c = rd(USB_BASE + USB_ENDPTCTRL(3));
+			if (c & CTRL_TXS)
+				wr(USB_BASE + USB_ENDPTCTRL(3), c);
+			c = rd(USB_BASE + USB_ENDPTCOMPLETE);
+			if (c & EPT_TX(3))
+				wr(USB_BASE + USB_ENDPTCOMPLETE, EPT_TX(3));
+			qh_prime(3, 1, &g_td_ep3, g_tx_buf, g_tx_len);
+			g_tx_start = ticks();
+			if (retries++ < 4)
+				log_printf("usb: tx3 stalled, retrying\n");
 		}
 		return;
 	}
 	n = ring_read(g_tx_buf, sizeof(g_tx_buf));
 	if (!n)
 		return;
+	g_tx_len = n;
 	qh_prime(3, 1, &g_td_ep3, g_tx_buf, n);
 	g_tx_busy = 1;
 	g_tx_start = ticks();
@@ -776,6 +813,7 @@ static void wdt_disable_and_log(void)
 {
 	u32 base = 0x0b017000;
 
+	g_boot_wdt_en = rd(base + 0x08);
 	log_printf("wdt: 00=%x rst=%x en=%x sts=%x bark=%x bite=%x\n",
 		   rd(base + 0x00), rd(base + 0x04), rd(base + 0x08),
 		   rd(base + 0x0c), rd(base + 0x10), rd(base + 0x14));
@@ -848,6 +886,497 @@ static void usb_attach(void)
 	log_printf("usb: attached usbcmd=%x\n", rd(USB_BASE + USB_USBCMD));
 }
 
+/* ---------------- SDHCI / eMMC read-only probe ---------------- */
+
+#define SDHCI_BASE		0x07824900u
+#define SDCC_CORE		0x07824000u
+
+#define GCC_SDCC1_BCR		0x01842000u
+#define GCC_SDCC1_CMD_RCGR	0x01842004u
+#define GCC_SDCC1_CFG_RCGR	0x01842008u
+#define GCC_SDCC1_M		0x0184200cu
+#define GCC_SDCC1_N		0x01842010u
+#define GCC_SDCC1_D		0x01842014u
+#define GCC_SDCC1_APPS_CBCR	0x01842018u
+#define GCC_SDCC1_AHB_CBCR	0x0184201cu
+
+#define SDHCI_BLKSZ		0x004
+#define SDHCI_BLK_CNT		0x006
+#define SDHCI_ARGUMENT		0x008
+#define SDHCI_TRANS_MODE	0x00c
+#define SDHCI_CMD		0x00e
+#define SDHCI_RESP		0x010
+#define SDHCI_PRESENT_STATE	0x024
+#define SDHCI_HOST_CTRL1	0x028
+#define SDHCI_PWR_CTRL		0x029
+#define SDHCI_CLK_CTRL		0x02c
+#define SDHCI_TIMEOUT_REG	0x02e
+#define SDHCI_RESET_REG		0x02f
+#define SDHCI_NRML_INT_STS	0x030
+#define SDHCI_ERR_INT_STS	0x032
+#define SDHCI_NRML_INT_EN	0x034
+#define SDHCI_ERR_INT_EN	0x036
+#define SDHCI_NRML_INT_SIG	0x038
+#define SDHCI_ERR_INT_SIG	0x03a
+#define SDHCI_HOST_CTRL2	0x03e
+#define SDHCI_CAPS1		0x040
+#define SDHCI_CAPS2		0x044
+#define SDHCI_ADMA_ADDR		0x058
+#define SDHCI_VENDOR_SPEC	0x10c
+#define SDHCI_VENDOR_CAPS0	0x11c
+
+#define SDCC_MCI_VERSION	0x050
+#define SDCC_MCI_HC_MODE	0x078
+#define SDCC_PWRCTL_STATUS	0x0dc
+#define SDCC_PWRCTL_MASK	0x0e0
+#define SDCC_PWRCTL_CLEAR	0x0e4
+#define SDCC_PWRCTL_CTL		0x0e8
+
+struct adma2_desc {
+	u16 attr;
+	u16 len;
+	u32 addr;
+};
+
+static struct adma2_desc g_adma __attribute__((aligned(64)));
+static u8 g_emmc_blk[1024] __attribute__((aligned(64)));
+static u32 g_sd_resp[4];
+
+static u32 wait8_clear(u64 addr, u8 mask, u32 ms)
+{
+	u32 s = ticks();
+	volatile u32 n = ms * g_spin_budget;
+
+	for (;;) {
+		if (!(rd8(addr) & mask))
+			return 0;
+		if (g_tick_ms) {
+			if (elapsed_ms(s) >= ms)
+				return 1;
+		} else if (!n) {
+			return 1;
+		} else {
+			n--;
+		}
+	}
+}
+
+static void sdcc_pwr_irq_ack(void)
+{
+	u32 st = rd(SDCC_CORE + SDCC_PWRCTL_STATUS);
+	u32 ctl;
+
+	if (!st)
+		return;
+	wr(SDCC_CORE + SDCC_PWRCTL_CLEAR, st);
+	ctl = rd(SDCC_CORE + SDCC_PWRCTL_CTL);
+	if (st & 3)
+		ctl |= 1;
+	if (st & 0xc)
+		ctl |= 4;
+	wr(SDCC_CORE + SDCC_PWRCTL_CTL, ctl);
+}
+
+static void sdcc_err_reset(void)
+{
+	wr8(SDHCI_BASE + SDHCI_RESET_REG, 0x06);
+	wait8_clear(SDHCI_BASE + SDHCI_RESET_REG, 0x06, 100);
+}
+
+static u32 sdcc_wait_idle(u32 ms)
+{
+	u32 s = ticks();
+	volatile u32 n = ms * g_spin_budget;
+
+	while (rd(SDHCI_BASE + SDHCI_PRESENT_STATE) & 3) {
+		if (g_tick_ms) {
+			if (elapsed_ms(s) >= ms)
+				return 1;
+		} else if (!n) {
+			return 1;
+		} else {
+			n--;
+		}
+	}
+	return 0;
+}
+
+/*
+ * kind: 0 = no response, 1 = R2 (136 bit, CRC),
+ *       2 = 48 bit with CRC+index checks (R1/R6/R7), 3 = 48 bit R3
+ */
+static u32 sdcc_cmd(u32 idx, u32 arg, u32 kind)
+{
+	u32 flags, st, s;
+	volatile u32 n;
+
+	if (sdcc_wait_idle(100))
+		return 0x100;
+
+	wr16(SDHCI_BASE + SDHCI_NRML_INT_STS, 0xffff);
+	wr16(SDHCI_BASE + SDHCI_ERR_INT_STS, 0xffff);
+	wr8(SDHCI_BASE + SDHCI_TIMEOUT_REG, 0x0f);
+	wr(SDHCI_BASE + SDHCI_ARGUMENT, arg);
+
+	if (kind == 1)
+		flags = 1 | (1u << 3);
+	else if (kind == 2)
+		flags = 2 | (1u << 3) | (1u << 4);
+	else if (kind == 3)
+		flags = 2;
+	else
+		flags = 0;
+	wr16(SDHCI_BASE + SDHCI_CMD, (u16)((idx << 8) | flags));
+
+	s = ticks();
+	n = 1000 * g_spin_budget;
+	for (;;) {
+		st = rd16(SDHCI_BASE + SDHCI_NRML_INT_STS);
+		if (st & 1u)
+			break;
+		if (rd16(SDHCI_BASE + SDHCI_ERR_INT_STS) || (st & 0x8000u)) {
+			u32 e = rd16(SDHCI_BASE + SDHCI_ERR_INT_STS);
+			log_printf("emmc: cmd%u err=%x\n", idx, e);
+			sdcc_err_reset();
+			return 0x200 | (e & 0xff);
+		}
+		if (g_tick_ms) {
+			if (elapsed_ms(s) >= 1000)
+				goto timeout;
+		} else if (!n--) {
+			goto timeout;
+		}
+	}
+	wr16(SDHCI_BASE + SDHCI_NRML_INT_STS, 1);
+
+	if (kind == 1) {
+		int i;
+		for (i = 0; i < 4; i++) {
+			g_sd_resp[i] =
+				rd(SDHCI_BASE + SDHCI_RESP + 4 * i) << 8;
+			if (i)
+				g_sd_resp[i] |=
+					rd(SDHCI_BASE + SDHCI_RESP + 4 * (i - 1)) >> 24;
+		}
+	} else if (kind) {
+		g_sd_resp[0] = rd(SDHCI_BASE + SDHCI_RESP);
+	}
+	return 0;
+
+timeout:
+	log_printf("emmc: cmd%u timeout st=%x\n", idx,
+		   rd16(SDHCI_BASE + SDHCI_NRML_INT_STS));
+	sdcc_err_reset();
+	return 0x300;
+}
+
+static u32 sdcc_read_block(u32 lba, void *buf)
+{
+	u32 st = 0, s;
+	volatile u32 n;
+	u32 done_data = 0;
+
+	if (sdcc_wait_idle(100))
+		return 0x100;
+
+	wr16(SDHCI_BASE + SDHCI_NRML_INT_STS, 0xffff);
+	wr16(SDHCI_BASE + SDHCI_ERR_INT_STS, 0xffff);
+	g_adma.attr = 0x0023;		/* VALID | END | ACT=tran */
+	g_adma.len = 512;
+	g_adma.addr = (u32)(u64)buf;
+	barrier();
+
+	wr(SDHCI_BASE + SDHCI_ADMA_ADDR, (u32)(u64)&g_adma);
+	wr16(SDHCI_BASE + SDHCI_BLKSZ, 512);
+	wr16(SDHCI_BASE + SDHCI_BLK_CNT, 1);
+	wr8(SDHCI_BASE + SDHCI_TIMEOUT_REG, 0x0f);
+	wr(SDHCI_BASE + SDHCI_ARGUMENT, lba);
+	wr16(SDHCI_BASE + SDHCI_TRANS_MODE, 0x0011);	/* DMA | read, single */
+	wr16(SDHCI_BASE + SDHCI_CMD,
+	     (u16)((17 << 8) | 2 | (1u << 3) | (1u << 4) | (1u << 5)));
+
+	s = ticks();
+	n = 2000 * g_spin_budget;
+	for (;;) {
+		u32 err = rd16(SDHCI_BASE + SDHCI_ERR_INT_STS);
+
+		st = rd16(SDHCI_BASE + SDHCI_NRML_INT_STS);
+		if (err || (st & 0x8000u)) {
+			log_printf("emmc: read err=%x st=%x\n", err, st);
+			sdcc_err_reset();
+			return 0x200 | (err & 0xff);
+		}
+		if (st & 1u)
+			wr16(SDHCI_BASE + SDHCI_NRML_INT_STS, 1);
+		if (st & 2u) {
+			wr16(SDHCI_BASE + SDHCI_NRML_INT_STS, 2);
+			done_data = 1;
+			break;
+		}
+		if (g_tick_ms) {
+			if (elapsed_ms(s) >= 2000)
+				break;
+		} else if (!n--) {
+			break;
+		}
+	}
+	if (!done_data) {
+		log_printf("emmc: read timeout st=%x\n", st);
+		sdcc_err_reset();
+		return 0x300;
+	}
+	return 0;
+}
+
+static void sdcc_host_init(void)
+{
+	u32 caps, ver, v;
+	u8 volt = 0;
+
+	/* interface (AHB) clock, then apps clock = GPLL0(800)/16 = 50 MHz */
+	branch_enable(GCC_SDCC1_AHB_CBCR);
+	wr(GCC_SDCC1_M, 0);
+	wr(GCC_SDCC1_N, 0);
+	wr(GCC_SDCC1_D, 0xffffffffu);
+	v = rd(GCC_SDCC1_CFG_RCGR);
+	v &= ~((0x7u << 8) | 0x1fu | (0x3u << 12));
+	v |= (1u << 8) | 31u;
+	wr(GCC_SDCC1_CFG_RCGR, v);
+	wr(GCC_SDCC1_CMD_RCGR, rd(GCC_SDCC1_CMD_RCGR) | 1u);
+	wait_clear(GCC_SDCC1_CMD_RCGR, 1u, 100);
+	branch_enable(GCC_SDCC1_APPS_CBCR);
+	log_printf("emmc: clk bcr=%x cfg=%x cmd=%x apps=%x ahb=%x\n",
+		   rd(GCC_SDCC1_BCR), rd(GCC_SDCC1_CFG_RCGR),
+		   rd(GCC_SDCC1_CMD_RCGR), rd(GCC_SDCC1_APPS_CBCR),
+		   rd(GCC_SDCC1_AHB_CBCR));
+
+	wr(SDHCI_BASE + SDHCI_VENDOR_SPEC, 0xa1c);
+	wr(SDCC_CORE + SDCC_MCI_HC_MODE,
+	   rd(SDCC_CORE + SDCC_MCI_HC_MODE) | 1u | (1u << 13));
+
+	wr8(SDHCI_BASE + SDHCI_RESET_REG, 1);
+	if (wait8_clear(SDHCI_BASE + SDHCI_RESET_REG, 1, 100))
+		log_puts("emmc: reset stuck\n");
+
+	/* drop whatever the reset raised, then unmask the power irq */
+	sdcc_pwr_irq_ack();
+	wr(SDCC_CORE + SDCC_PWRCTL_MASK, 0xf);
+
+	ver = rd(SDCC_CORE + SDCC_MCI_VERSION);
+	caps = rd(SDHCI_BASE + SDHCI_CAPS1);
+	log_printf("emmc: ver=%x caps=%x cap2=%x\n",
+		   ver, caps, rd(SDHCI_BASE + SDHCI_CAPS2));
+
+	if ((ver >> 28) >= 1 && (ver & 0xff) != 0x11 && (ver & 0xff) != 0x12)
+		wr(SDHCI_BASE + SDHCI_VENDOR_CAPS0, caps | (1u << 26));
+
+	if (caps & (1u << 24))
+		volt = 7;
+	else if (caps & (1u << 25))
+		volt = 6;
+	else if (caps & (1u << 26))
+		volt = 5;
+
+	wr8(SDHCI_BASE + SDHCI_PWR_CTRL, (u8)(volt << 1));
+	wr8(SDHCI_BASE + SDHCI_PWR_CTRL, (u8)((volt << 1) | 1));
+	{
+		int i;
+		for (i = 0; i < 8; i++) {
+			delay_ms(1);
+			sdcc_pwr_irq_ack();
+		}
+	}
+	log_printf("emmc: pwr=%x status=%x\n",
+		   rd8(SDHCI_BASE + SDHCI_PWR_CTRL),
+		   rd(SDCC_CORE + SDCC_PWRCTL_STATUS));
+
+	/* 1-bit bus, ADMA2 32-bit */
+	wr8(SDHCI_BASE + SDHCI_HOST_CTRL1,
+	    (u8)((rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) & ~0x20u) | (1u << 4)));
+
+	/* ~390 kHz: 50 MHz / (2 * 64) */
+	{
+		u16 val = (u16)((64u << 8) | 1u);
+
+		wr16(SDHCI_BASE + SDHCI_CLK_CTRL, val);
+		{
+			u32 s = ticks();
+			volatile u32 n = 100 * g_spin_budget;
+
+			while (!(rd16(SDHCI_BASE + SDHCI_CLK_CTRL) & 2)) {
+				if (g_tick_ms) {
+					if (elapsed_ms(s) >= 100)
+						break;
+				} else if (!n) {
+					break;
+				} else {
+					n--;
+				}
+			}
+		}
+		val = rd16(SDHCI_BASE + SDHCI_CLK_CTRL);
+		wr16(SDHCI_BASE + SDHCI_CLK_CTRL, (u16)(val | 4));
+		log_printf("emmc: clk ctl=%x host1=%x\n",
+			   rd16(SDHCI_BASE + SDHCI_CLK_CTRL),
+			   rd8(SDHCI_BASE + SDHCI_HOST_CTRL1));
+	}
+
+	wr16(SDHCI_BASE + SDHCI_NRML_INT_EN, 0x000b);
+	wr16(SDHCI_BASE + SDHCI_ERR_INT_EN, 0xffff);
+	wr16(SDHCI_BASE + SDHCI_NRML_INT_SIG, 0x000b);
+	wr16(SDHCI_BASE + SDHCI_ERR_INT_SIG, 0xffff);
+}
+
+static void emmc_probe(void)
+{
+	u32 r, ocr = 0, i;
+	u8 *blk = g_emmc_blk;
+
+	log_puts("emmc: probe start\n");
+	sdcc_host_init();
+
+	r = sdcc_cmd(0, 0, 0);
+	log_printf("emmc: cmd0 %u\n", r);
+	if (r) {
+		g_emmc_state = 1;
+		return;
+	}
+
+	for (i = 0; i < 1000; i++) {
+		r = sdcc_cmd(1, 0x40ff8000u, 3);
+		if (r) {
+			g_emmc_state = 2;
+			log_printf("emmc: cmd1 %u\n", r);
+			return;
+		}
+		ocr = g_sd_resp[0];
+		if (ocr & 0x80000000u)
+			break;
+		delay_ms(1);
+	}
+	log_printf("emmc: cmd1 ocr=%x tries=%u\n", ocr, i);
+	if (!(ocr & 0x80000000u)) {
+		g_emmc_state = 3;
+		return;
+	}
+
+	r = sdcc_cmd(2, 0, 1);
+	log_printf("emmc: cmd2 %u\n", r);
+	if (r) {
+		g_emmc_state = 4;
+		return;
+	}
+	{
+		u8 pnm[7];
+		u32 c0 = g_sd_resp[0], c1 = g_sd_resp[1], c2 = g_sd_resp[2];
+
+		pnm[0] = (u8)c0;
+		pnm[1] = (u8)(c1 >> 24);
+		pnm[2] = (u8)(c1 >> 16);
+		pnm[3] = (u8)(c1 >> 8);
+		pnm[4] = (u8)c1;
+		pnm[5] = (u8)(c2 >> 24);
+		pnm[6] = 0;
+		for (i = 0; i < 6; i++)
+			if (pnm[i] < 0x20 || pnm[i] > 0x7e)
+				pnm[i] = '.';
+		log_printf("emmc: cid mid=%x oid=%x pnm=%s\n",
+			   (c0 >> 24) & 0xff, (c0 >> 8) & 0xffff, pnm);
+	}
+
+	r = sdcc_cmd(3, 2u << 16, 2);
+	log_printf("emmc: cmd3 %u resp=%x\n", r, g_sd_resp[0]);
+	if (r) {
+		g_emmc_state = 5;
+		return;
+	}
+
+	r = sdcc_cmd(9, 2u << 16, 1);
+	log_printf("emmc: cmd9 %u\n", r);
+	if (r) {
+		g_emmc_state = 6;
+		return;
+	}
+
+	r = sdcc_cmd(7, 2u << 16, 2);
+	log_printf("emmc: cmd7 %u resp=%x\n", r, g_sd_resp[0]);
+	if (r) {
+		g_emmc_state = 7;
+		return;
+	}
+
+	r = sdcc_cmd(16, 512, 2);
+	log_printf("emmc: cmd16 %u resp=%x\n", r, g_sd_resp[0]);
+	if (r) {
+		g_emmc_state = 8;
+		return;
+	}
+
+	r = sdcc_read_block(0, blk);
+	log_printf("emmc: lba0 %u\n", r);
+	if (r) {
+		g_emmc_state = 9;
+		return;
+	}
+	{
+		u32 *w = (u32 *)blk;
+
+		log_printf("emmc: lba0 %x %x %x %x sig=%x ptype=%x\n",
+			   w[0], w[1], w[2], w[3],
+			   blk[510] | (blk[511] << 8), blk[0x1c2]);
+	}
+
+	r = sdcc_read_block(1, blk + 512);
+	if (!r) {
+		u32 *w = (u32 *)(blk + 512);
+
+		log_printf("emmc: lba1 %x %x gpt=%s\n", w[0], w[1],
+			   (w[0] == 0x20494645u && w[1] == 0x54524150u) ?
+			   "yes" : "no");
+	} else {
+		log_printf("emmc: lba1 %u\n", r);
+	}
+	g_emmc_state = 0;
+}
+
+static void boot_replay(void)
+{
+	static u32 last;
+
+	/* macOS re-sends SET_LINE_CODING several times around open */
+	if (last && elapsed_ms(last) < 5000)
+		return;
+	last = ticks();
+
+	log_printf("\n-- v6 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
+		   g_boot_dtb, g_boot_dtb_ok ? "ok" : "bad",
+		   g_boot_midr, g_boot_cntfrq, g_tick_ms);
+	log_printf("-- wdt_en=%x usb=%s emmc=%s\n", g_boot_wdt_en,
+		   g_configured ? (bus_highspeed() ? "hs" : "fs") : "off",
+		   g_emmc_state == 0 ? "ok" : (g_emmc_state == 0xffff ?
+					       "not probed" : "failed"));
+}
+
+/* run once, after enumeration settled (or 10 s after attach) */
+static void probe_tick(void)
+{
+	static u32 started, t0, spin;
+
+	if (started)
+		return;
+	if (g_tick_ms) {
+		if (!t0)
+			t0 = ticks();
+		if (!g_configured && elapsed_ms(t0) < 10000)
+			return;
+	} else {
+		if (!g_configured && ++spin < 0x2000000)
+			return;
+	}
+	started = 1;
+	emmc_probe();
+}
+
 /* ---------------- main ---------------- */
 
 void exc_report(u64 esr, u64 elr, u64 far)
@@ -917,13 +1446,19 @@ void kmain(u64 dtb)
 	__asm__ volatile("mrs %0, midr_el1" : "=r"(midr));
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
 
-	log_printf("\nios-sweet vivo Y21L stage0 v5: AArch64 payload\n");
+	log_printf("\nios-sweet vivo Y21L stage0 v6: AArch64 payload\n");
+	g_boot_dtb = dtb;
+	g_boot_cntfrq = cntfrq;
+	g_boot_midr = (u32)midr;
+	g_boot_dtb_ok = 0;
 	log_printf("dtb=%lx", dtb);
 	if (dtb >= 0x80000000ull && dtb < 0xc0000000ull &&
-	    *(volatile u32 *)(u64)dtb == 0xd00dfeedu)
+	    *(volatile u32 *)(u64)dtb == 0xedfe0dd0u) {
+		g_boot_dtb_ok = 1;
 		log_puts(" magic ok\n");
-	else
+	} else {
 		log_puts(" magic bad\n");
+	}
 	log_printf("mpidr=%lx midr=%x cntfrq=%lx tick_ms=%u\n",
 		   mpidr, (u32)midr, cntfrq, g_tick_ms);
 
@@ -942,6 +1477,7 @@ void kmain(u64 dtb)
 	for (;;) {
 		usb_poll();
 		usb_pump();
+		probe_tick();
 		heartbeat();
 		status_tick();
 	}
