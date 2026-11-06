@@ -452,6 +452,35 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   dipa-studio), so pushes go to the `fork` remote
   git@github.com:tulsiojha/ios-sweet.git; origin/dipa-studio/main stays at 45263be
   until the user merges.
+- **v21 TEST (2026-11-06 23:10): arm_init IS reached; the hang is in the early-console init.**
+  out/vivo-boot-beacon1.img (0d5cfce3...6071) flashed; /tmp/vivo-v21.log shows two
+  sessions of the same boot: [open 23:10:55] -> stage0 GPT dump + heartbeats +
+  `loader: jumping ... el=1` -> [closed 23:11:23] "Device not configured", then the
+  phone re-powered on VBUS and session 2 [open 23:11:29] repeated it -> [closed
+  23:11:57]. In v19/v20 the tty stayed open for the whole reader run and no
+  [closed] ever appeared, so the v21 exit is the pshold beacon, not a watchdog:
+  start.s completes and arm_init C code runs. The device was never reset in
+  v19/v20 either (a USBCMD.RESET deasserts the D+ pull-up, which macOS reports as
+  a close), so the hang sits inside usbcon_early_start/usbcon_hw_init before the
+  USBCMD reset - i.e. in usbcon_clocks_init, the only hardware access in that
+  window.
+- **FIX CANDIDATE (v22, built, NOT yet flashed): keep the loader's clock setup.**
+  usbcon_clocks_init runs LK's cold-boot sequence (enable, disable, GCC block
+  reset via BCR, enable); stage0 runs that once from reset and then leaves the
+  block live (on-device readback cfg=00000113 sys=00004ff1 ahb=2000cff1,
+  /tmp/vivo-v21.log line 17). xnu was re-running the disable + hard reset on the
+  running controller, which can stall the USB AHB port. The function now reads
+  CFG_RCGR and both CBCRs first and returns early when cfg == 0x113 and both
+  branches are enabled. The temporary arm_init pshold beacon is removed; the
+  PS_HOLD V=P block remains in start.s for further beacon runs. Kernel
+  10,210,152 B; disassembly check at _usbcon_hw_init+0xc8 (`and 0x71f; cmp
+  0x113; tbz #0; tbnz #0 -> 0x797bbc`), skip target is the bzero, no pshold
+  store left in _arm_init. Image `out/vivo-boot-noclkreset.img` 29,154,538 B,
+  sha256 97469bbcc6dc33442ad00809b337a89e6b7485269d39db87cfa6a3869a8c74e2.
+  Repo patch still reflects the v20 (OSLAR) tree - regenerate it only after this
+  test. Reading: USB re-enumerates (USBCMD.RESET) and `xnu> arm_init` prints ->
+  clock re-init was the hang; tty stays silent -> the GCC read itself or a later
+  step is at fault, next beacon goes right after usbcon_clocks_init.
 - **Port deltas vs sweet:** 32-bit stage0 (real one) must switch AArch32 EL2 -> AArch64
   (lk2nd-style HCR.RW + eret) and then jump to the AArch64 payload; SDHCI eMMC driver,
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
