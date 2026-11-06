@@ -144,8 +144,9 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
-    segs = [s for s in m['segs'] if s['vmsize']]
-    text = m['segs'][0]
+    # MH_EXECUTE test kernels carry a __PAGEZERO guard; a real kernel does not.
+    segs = [s for s in m['segs'] if s['vmsize'] and s['name'] != '__PAGEZERO']
+    text = segs[0]
     assert text['name'] == '__TEXT' and text['fileoff'] == 0
     # virt_base: 32MB (16K-granule L2 block) below the mach header, so start.s's
     # block mapping that starts at the header's block begins exactly at phys_base.

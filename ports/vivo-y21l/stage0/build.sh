@@ -23,8 +23,9 @@ done
 # v5: C payload, linked at 0x8000a000
 "$LLVM/clang" "${A64FLAGS[@]}" -c payload/entry.S -o out/entry.o
 "$LLVM/clang" "${A64FLAGS[@]}" -c payload/payload.c -o out/payload.o
+"$LLVM/clang" "${A64FLAGS[@]}" -c payload/loader.c -o out/loader.o
 "$RUST_LLD" -flavor gnu -T payload/payload.ld --build-id=none \
-	-o out/payload.elf out/entry.o out/payload.o
+	-o out/payload.elf out/entry.o out/payload.o out/loader.o
 "$LLVM/llvm-objcopy" -O binary out/payload.elf out/payload.bin
 
 # v4 blob: ARM32 stub at 0x80008000, AArch64 payload at 0x8000a000 (offset 0x2000)

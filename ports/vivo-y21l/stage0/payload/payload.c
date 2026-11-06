@@ -38,8 +38,14 @@
  * prove the 1 kHz cadence is our timer and not a free-running source.
  * v13 also showed PPI 29 mirroring PPI 19 one-for-one at 1 kHz while the
  * handler was rearming CNTP from the 29 branch; with rearm moved to 19
- * v14 shows whether that coupling survives. USB and SDCC stay polled.
- * Fault vectors decode ESR.
+ * v14 shows whether that coupling survives (it does not fire any more).
+ * v15 is the sweet-style payload milestone: a SWEETXNU blob built by
+ * tools/mkpayload.py from a Mach-O kernel + an msm8916 ADT is injected
+ * into the boot.img ramdisk slot (LK loads it to 0x82000000), and
+ * payload/loader.c copies its segments next to phys_base, builds the
+ * arm64 boot_args and jumps. The first test kernel just writes
+ * qcom,pshold, so a power-off right after the loader lines proves the
+ * whole chain. USB and SDCC stay polled. Fault vectors decode ESR.
  */
 
 #include <stdarg.h>
@@ -789,6 +795,17 @@ static void usb_pump(void)
 	qh_prime(3, 1, &g_td_ep3, g_tx_buf, n);
 	g_tx_busy = 1;
 	g_tx_start = ticks();
+}
+
+/* Keep pumping the log ring before a jump that may never return. */
+void log_drain(u32 ms)
+{
+	u32 t0 = ticks();
+
+	while (elapsed_ms(t0) < ms) {
+		usb_poll();
+		usb_pump();
+	}
 }
 
 /* ---------------- clocks / platform ---------------- */
@@ -1802,7 +1819,7 @@ static void boot_replay(void)
 		return;
 	last = ticks();
 
-	log_printf("\n-- v14 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
+	log_printf("\n-- v15 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
 		   g_boot_dtb, g_boot_dtb_ok ? "ok" : "bad",
 		   g_boot_midr, g_boot_cntfrq, g_tick_ms);
 	log_printf("-- wdt_en=%x usb=%s emmc=%s fast=%x irq=%u\n", g_boot_wdt_en,
@@ -1972,6 +1989,10 @@ void exc_report(u64 esr, u64 elr, u64 far, u64 spsr)
 		;
 }
 
+/* ---------------- heartbeat ---------------- */
+
+extern const char *loader_boot(void);
+
 static void heartbeat(void)
 {
 	static u32 last, hb, spin;
@@ -1983,6 +2004,14 @@ static void heartbeat(void)
 	} else {
 		if (++spin & 0xfffff)
 			return;
+	}
+	/* Try the SWEETXNU payload once, after USB attach and the eMMC probe. */
+	if (hb == 25) {
+		const char *err;
+
+		log_puts("loader: trying payload @ 0x82000000\n");
+		err = loader_boot();
+		log_printf("loader: %s\n", err);
 	}
 	log_printf("hb %u drops %u sts %x portsc %x irq %u\n", hb++,
 		   g_ring_drops, rd(USB_BASE + USB_USBSTS),
@@ -2019,7 +2048,7 @@ void kmain(u64 dtb)
 	__asm__ volatile("mrs %0, midr_el1" : "=r"(midr));
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
 
-	log_printf("\nios-sweet vivo Y21L stage0 v14: AArch64 payload\n");
+	log_printf("\nios-sweet vivo Y21L stage0 v15: AArch64 payload\n");
 	g_boot_dtb = dtb;
 	g_boot_cntfrq = cntfrq;
 	g_boot_midr = (u32)midr;
