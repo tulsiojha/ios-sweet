@@ -238,7 +238,8 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   stage0's loader already maps by payload virt_base and passes virtBase/physBase
   0x88000000 in boot_args, and xnu then computes
   vm_kernel_slide = segTEXTB - VM_KERNEL_LINK_ADDRESS = 0. Not yet boot-tested.
-- **xnu-4903 boot image built, not flashed (2026-11-06):** the 10,199,328-byte
+- **xnu-4903 BOOT TEST v16 (2026-11-06): stage0 loads and jumps to the real kernel;
+  xnu then hangs silently (no console yet).** The 10,199,328-byte
   SWEETXNU payload does not fit the stock 3,678,553-byte ramdisk slot, so
   tools/vivo-repack-boot.py gained `--grow-ramdisk` (raise ramdisk_size in the boot
   header, move the QCDT + trailing PKCS#7 bytes after the blob; verified QCDT/tail
@@ -246,10 +247,23 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   `ports/vivo-y21l/out/vivo-boot-xnu4903.img`, 29,138,154 B (0x1BC9CEA): kernel slot =
   stage0v5 (39,824 B), ramdisk_size 0x9BA800, QCDT 0xA46000 moved 0xB4B800 ->
   0x1183800, sha256 55bbf1c4...d4b8. Hashes vary per build because mkadt's
-  random-seed is os.urandom(64). FLASH BLOCKER: the phone is not attached (no adb,
-  no fastboot device); boot partition must be >= 29,138,154 B, check with
-  `fastboot getvar partition-size:boot` (unknown whether this LK supports it; a
-  too-large image is refused at flash time, which is safe).
+  random-seed is os.urandom(64). `fastboot flash boot` wrote it in 1 s ("Sending
+  'boot' (28455 KB) OKAY"; this LK reports partition-size 0 and skips the AVB footer
+  copy). OBSERVATIONS from the stage0 console (/tmp/xnu4903-boot.log, 6503 B): boot
+  partition is 0x3AC60+0x20000 sectors = 64 MB (GPT dump), USB CDC console up, eMMC
+  probe + GPT read 36 entries, then `loader: payload v1 nsegs=8
+  virt=fffffff006000000 phys=0x88000000 size=0x37f00000`, `segs done,
+  end=0x89a50000 entry=0x890f90a0`, `adt=0x89a50000 ba=0x89a54000 top=0x89a58000
+  cmd="debug=0x8 serial=3 keepsyms=1"`, `jumping to 0x890f90a0` and ZERO further
+  output. The usbmodem node still enumerated but a 8 s re-read got 0 bytes (stage0
+  no longer services it); stage0 disabled the watchdog, so a faulted xnu stays hung
+  rather than rebooting. GUESS (unverified): xnu executes at least its early arm64
+  entry (no reset), but with no GIC/UART/platform expert and no console we cannot see
+  how far. FLASH STATE: stock boot.img NOT yet restored at the time of writing (the
+  phone hung after the jump; needs power-off + Vol-Down + USB to re-enter fastboot;
+  restore = `fastboot flash boot device-info/vivo-stock/boot.img`, sha256
+  51042586...35b1). Next: a console/side-effect probe for xnu (UART or the
+  ChipIdea device-mode USB behind ml_irq/IOCPU), then GICv2 + FDT platform expert.
   CI: `.github/workflows/xnu-4903.yml` (commit 8eedd8f) applies the patch to a fresh
   494ffe1 clone and builds on `macos-15-intel`. `macos-14` now resolves to
   `macos-14-arm64-us-default`, a configuration this repo cannot use ("The configuration
