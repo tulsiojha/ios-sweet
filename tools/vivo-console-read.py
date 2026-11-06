@@ -41,7 +41,7 @@ def main():
     attrs[0] = attrs[1] = attrs[2] = 0  # iflag, oflag, cflag: raw
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
-    out = open(a.out, "wb") if a.out else None
+    out = open(a.out, "ab") if a.out else None
     t0 = time.time()
     total = 0
     try:
@@ -60,7 +60,7 @@ def main():
             if out:
                 out.write(d)
                 out.flush()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, OSError):
         pass
     finally:
         os.close(fd)

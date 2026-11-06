@@ -140,7 +140,8 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   DEVICE_TYPE=0x1f57, SEC_COUNT=0x1d1f000 (14.56 GiB; userdata ends 0x21 sectors below),
   HS_TIMING=0 before the switch; BUS_WIDTH still reads 0x00 - bogus on this hynix part,
   stock LK ignores it too.** Bytes 176..191 as words: 38000000 00000000 00000001 00000000.
-  Boot partition still holds v8; stock restore pending (needs another fastboot trip).
+  Stock boot.img restored after the v8 test (fastboot flash boot + reboot, 2026-11-06);
+  Android 5.1.1 is back online via adb.
 - **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
   iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
   xnu-8796 + iOS 12 userland vs port xnu-4903).
