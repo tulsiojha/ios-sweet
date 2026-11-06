@@ -1,6 +1,6 @@
 /*
- * stage0 v6 AArch64 payload: polled ChipIdea USB device-mode console plus
- * an SDHCI eMMC read-only probe.
+ * stage0 v7b AArch64 payload: polled ChipIdea USB device-mode console plus
+ * an SDHCI eMMC block layer (8-bit/HS switch, multi-block reads, GPT scan).
  *
  * Runs at EL1 with the MMU and caches off, entered at 0x8000a000 by the
  * ARM32 secure-monitor stub (x0 = dtb). The USB controller is driven the
@@ -900,6 +900,27 @@ static void usb_attach(void)
 	log_printf("usb: attached usbcmd=%x\n", rd(USB_BASE + USB_USBCMD));
 }
 
+/* keep the console moving while a long polled operation runs; if the step
+ * hangs the CPU, everything logged so far is already on the wire */
+static void probe_drain(void)
+{
+	u32 s = ticks();
+
+	if (g_tick_ms) {
+		while (elapsed_ms(s) < 30) {
+			usb_poll();
+			usb_pump();
+		}
+	} else {
+		volatile u32 n = 200000;
+
+		while (n--) {
+			usb_poll();
+			usb_pump();
+		}
+	}
+}
+
 /* ---------------- SDHCI / eMMC read-only probe ---------------- */
 
 #define SDHCI_BASE		0x07824900u
@@ -1136,8 +1157,11 @@ static u32 sdcc_read_data(u32 idx, u32 arg, void *buf, u32 nblk)
 	wr8(SDHCI_BASE + SDHCI_TIMEOUT_REG, 0x0f);
 
 	if (nblk > 1) {
-		u32 r = sdcc_cmd(23, nblk, 2);
+		u32 r;
 
+		log_printf("emmc: multi %u blk @ %x\n", nblk, arg);
+		probe_drain();
+		r = sdcc_cmd(23, nblk, 2);
 		if (r) {
 			log_printf("emmc: cmd23 %u\n", r);
 			return 0x400 | r;
@@ -1220,6 +1244,8 @@ static u32 emmc_switch(u32 index, u32 value)
 {
 	u32 r, i, st = 0;
 
+	log_printf("emmc: sw %u=%u\n", index, value);
+	probe_drain();
 	r = sdcc_cmd(6, (3u << 24) | (index << 16) | (value << 8), 4);
 	if (r) {
 		log_printf("emmc: cmd6 idx=%u val=%u -> %u\n", index, value, r);
@@ -1244,23 +1270,28 @@ static u32 emmc_switch(u32 index, u32 value)
  * 25 MHz and verify with a fresh LBA0 read. On failure fall back to
  * 1-bit SDR at 390 kHz and verify again.
  */
-static void emmc_fast(u8 *blk)
+static u32 emmc_fast(u8 *blk)
 {
 	u32 r, widths, dev_type;
 
+	log_puts("emmc: ext_csd read\n");
+	probe_drain();
 	r = sdcc_read_data(8, 0, g_ext_csd, 1);
 	if (r) {
 		log_printf("emmc: ext_csd %u\n", r);
-		return;
+		probe_drain();
+		return 1;
 	}
 	widths = g_ext_csd[183];
 	dev_type = g_ext_csd[196] | (g_ext_csd[197] << 8);
 	log_printf("emmc: bus_w=%x dev_type=%x hs_timing=%x\n",
 		   widths, dev_type, g_ext_csd[185]);
+	probe_drain();
 
 	if (widths & 4) {		/* bit2: 8-bit supported */
 		r = emmc_switch(183, 2);
 		log_printf("emmc: 8bit %u\n", r);
+		probe_drain();
 		if (!r) {
 			wr8(SDHCI_BASE + SDHCI_HOST_CTRL1,
 			    (u8)((rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) & ~2u) | 0x20u));
@@ -1271,7 +1302,10 @@ static void emmc_fast(u8 *blk)
 	if (!r && (dev_type & 6)) {	/* any HS timing bit */
 		r = emmc_switch(185, 1);
 		log_printf("emmc: hs %u\n", r);
+		probe_drain();
 		if (!r) {
+			log_puts("emmc: raise clk\n");
+			probe_drain();
 			wr8(SDHCI_BASE + SDHCI_HOST_CTRL1,
 			    (u8)(rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) | 4u));
 			sdcc_set_clock(1);
@@ -1279,15 +1313,18 @@ static void emmc_fast(u8 *blk)
 			log_printf("emmc: clk ctl=%x host1=%x\n",
 				   rd16(SDHCI_BASE + SDHCI_CLK_CTRL),
 				   rd8(SDHCI_BASE + SDHCI_HOST_CTRL1));
+			probe_drain();
 		}
 	}
 
 	r = sdcc_read_block(0, blk);
 	if (!r && blk[510] == 0x55 && blk[511] == 0xaa) {
 		log_printf("emmc: fast ok %x\n", g_emmc_fast);
-		return;
+		probe_drain();
+		return 0;
 	}
 	log_printf("emmc: fast verify failed %u\n", r);
+	probe_drain();
 
 	/* back to 1-bit SDR at 390 kHz */
 	sdcc_set_clock(64);
@@ -1301,6 +1338,8 @@ static void emmc_fast(u8 *blk)
 	r = sdcc_read_block(0, blk);
 	log_printf("emmc: slow retry %u sig=%x\n",
 		   r, blk[510] | (blk[511] << 8));
+	probe_drain();
+	return r || blk[510] != 0x55 || blk[511] != 0xaa;
 }
 
 /* read the GPT entry array (CMD23 + CMD18) and list used partitions */
@@ -1323,6 +1362,7 @@ static void gpt_scan(void)
 	n_ent = w[20];
 	e_sz = w[21];
 	log_printf("gpt: entries lba=%lx n=%u esz=%u\n", ent_lba, n_ent, e_sz);
+	probe_drain();
 	if (!n_ent || e_sz != 128) {
 		log_puts("gpt: unexpected layout\n");
 		return;
@@ -1335,8 +1375,11 @@ static void gpt_scan(void)
 	}
 
 	blocks = (n_ent * e_sz + 511) / 512;
+	log_printf("gpt: reading %u blocks\n", blocks);
+	probe_drain();
 	r = sdcc_read_data(18, (u32)ent_lba, g_gpt_ent, blocks);
 	log_printf("gpt: read %u blocks -> %u\n", blocks, r);
+	probe_drain();
 	if (r)
 		return;
 
@@ -1362,6 +1405,7 @@ static void gpt_scan(void)
 		count++;
 	}
 	log_printf("gpt: %u partitions\n", count);
+	probe_drain();
 }
 
 static void sdcc_host_init(void)
@@ -1448,10 +1492,13 @@ static void emmc_probe(void)
 	u8 *blk = g_emmc_blk;
 
 	log_puts("emmc: probe start\n");
+	probe_drain();
 	sdcc_host_init();
+	probe_drain();
 
 	r = sdcc_cmd(0, 0, 0);
 	log_printf("emmc: cmd0 %u\n", r);
+	probe_drain();
 	if (r) {
 		g_emmc_state = 1;
 		return;
@@ -1470,6 +1517,7 @@ static void emmc_probe(void)
 		delay_ms(1);
 	}
 	log_printf("emmc: cmd1 ocr=%x tries=%u\n", ocr, i);
+	probe_drain();
 	if (!(ocr & 0x80000000u)) {
 		g_emmc_state = 3;
 		return;
@@ -1498,9 +1546,11 @@ static void emmc_probe(void)
 		log_printf("emmc: cid mid=%x oid=%x pnm=%s\n",
 			   (c0 >> 24) & 0xff, (c0 >> 8) & 0xffff, pnm);
 	}
+	probe_drain();
 
 	r = sdcc_cmd(3, 2u << 16, 2);
 	log_printf("emmc: cmd3 %u resp=%x\n", r, g_sd_resp[0]);
+	probe_drain();
 	if (r) {
 		g_emmc_state = 5;
 		return;
@@ -1508,6 +1558,7 @@ static void emmc_probe(void)
 
 	r = sdcc_cmd(9, 2u << 16, 1);
 	log_printf("emmc: cmd9 %u\n", r);
+	probe_drain();
 	if (r) {
 		g_emmc_state = 6;
 		return;
@@ -1515,6 +1566,7 @@ static void emmc_probe(void)
 
 	r = sdcc_cmd(7, 2u << 16, 2);
 	log_printf("emmc: cmd7 %u resp=%x\n", r, g_sd_resp[0]);
+	probe_drain();
 	if (r) {
 		g_emmc_state = 7;
 		return;
@@ -1522,6 +1574,7 @@ static void emmc_probe(void)
 
 	r = sdcc_cmd(16, 512, 2);
 	log_printf("emmc: cmd16 %u resp=%x\n", r, g_sd_resp[0]);
+	probe_drain();
 	if (r) {
 		g_emmc_state = 8;
 		return;
@@ -1529,6 +1582,7 @@ static void emmc_probe(void)
 
 	r = sdcc_read_block(0, blk);
 	log_printf("emmc: lba0 %u\n", r);
+	probe_drain();
 	if (r) {
 		g_emmc_state = 9;
 		return;
@@ -1540,6 +1594,7 @@ static void emmc_probe(void)
 			   w[0], w[1], w[2], w[3],
 			   blk[510] | (blk[511] << 8), blk[0x1c2]);
 	}
+	probe_drain();
 
 	r = sdcc_read_block(1, blk + 512);
 	if (!r) {
@@ -1551,9 +1606,10 @@ static void emmc_probe(void)
 	} else {
 		log_printf("emmc: lba1 %u\n", r);
 	}
+	probe_drain();
 
-	emmc_fast(blk);
-	gpt_scan();
+	if (!emmc_fast(blk))
+		gpt_scan();
 	g_emmc_state = 0;
 }
 
@@ -1566,7 +1622,7 @@ static void boot_replay(void)
 		return;
 	last = ticks();
 
-	log_printf("\n-- v6 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
+	log_printf("\n-- v7b dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
 		   g_boot_dtb, g_boot_dtb_ok ? "ok" : "bad",
 		   g_boot_midr, g_boot_cntfrq, g_tick_ms);
 	log_printf("-- wdt_en=%x usb=%s emmc=%s fast=%x\n", g_boot_wdt_en,
@@ -1576,7 +1632,8 @@ static void boot_replay(void)
 		   g_emmc_fast);
 }
 
-/* run once, after enumeration settled (or 10 s after attach) */
+/* run once, 20 s in, so the host can open the port and see the log live
+ * even if a probe step hangs the CPU */
 static void probe_tick(void)
 {
 	static u32 started, t0, spin;
@@ -1586,13 +1643,14 @@ static void probe_tick(void)
 	if (g_tick_ms) {
 		if (!t0)
 			t0 = ticks();
-		if (!g_configured && elapsed_ms(t0) < 10000)
+		if (elapsed_ms(t0) < 20000)
 			return;
 	} else {
-		if (!g_configured && ++spin < 0x2000000)
+		if (++spin < 0x8000000)
 			return;
 	}
 	started = 1;
+	probe_drain();
 	emmc_probe();
 }
 

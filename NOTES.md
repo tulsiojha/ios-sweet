@@ -109,7 +109,17 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   LBA1, entry array (128x128 B = 32 blocks) read with CMD23 + multi-block CMD18 through a
   chunked ADMA2 table, listing name/first LBA/block count per used partition. Replay gains
   `fast=%x` (1 = 8-bit, 4 = 25 MHz). Image `device-info/vivo-stock/vivo-test7-boot.img`
-  sha256 c3fd6b54...0965b. Hardware test pending.
+  sha256 c3fd6b54...0965b. **Flashed 2026-11-06: the payload enumerated (USB serial
+  appears, ioreg "vivo Y21L stage0", same instance id throughout, no re-enumeration) but
+  the CPU hung inside the probe before the host could read any log; opening the tty then
+  blocks in control transfers. Cause not yet located (a v6-style run with only CMD8/CMD6/
+  clock/CMD18 added hangs; the fault handler exists but nothing reached the wire).** v7b
+  (image `vivo-test7b-boot.img` sha256 9bb431e1...49ec) is pure instrumentation: probe now
+  starts 20 s after attach, `probe_drain()` (30 ms of usb_poll/usb_pump) after every probe
+  log line and before risky steps, extra `emmc: sw idx=val`, `emmc: ext_csd read`,
+  `emmc: raise clk`, `emmc: multi N blk @ lba` markers; GPT scan runs only if the post-switch
+  verify read passed. Next: power-cycle into fastboot, flash v7b, pre-arm a tty reader so the
+  log is caught live, and read the last line before the hang.
 - **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
   iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
   xnu-8796 + iOS 12 userland vs port xnu-4903).
