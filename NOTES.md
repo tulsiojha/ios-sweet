@@ -165,18 +165,43 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   (v10), 0202aa9 (v11), f30742e (v12), 0c7cbec (v13), 9dd1e88 (v14). Open oddity,
   irrelevant to the tick: PPI 29 mirrored PPI 19 1:1 at 1 kHz in v13 only, while the
   handler happened to rearm CNTP from the 29 branch - cause unexplained.
+- **SWEETXNU payload pipeline v15 (2026-11-06): WORKS end-to-end on hardware.** stage0
+  now plays sweet's shim role: `ports/vivo-y21l/mkpayload.sh` builds the whole chain -
+  stage0 into the boot.img kernel slot, and a SWEETXNU blob (Mach-O kernel + ADT, from
+  `tools/mkpayload.py`) into the ramdisk slot, which LK loads to 0x82000000.
+  `stage0/payload/loader.c` checks the magic, copies segments to
+  dram-base + (vmaddr - virt_base), places the ADT + arm64 boot_args (Rev 2) behind the
+  kernel and jumps with MMU off, x0 = boot_args pa, like shim/loader.c. First payload:
+  `ports/vivo-y21l/ktest.S`, a stub that writes qcom,pshold - power-off is the pass
+  signal. Render: `payload v1 nsegs=2 virt=0x100000000 phys=0x88000000`, segs end
+  0x88008000, ADT 0x88008000, boot_args 0x8800c000, jump to 0x880002e8 -> the phone
+  powered itself off with no further log bytes, i.e. the stub really executed.
+  The ADT (`ports/vivo-y21l/mkadt.py`) is a provisional msm8916 tree: 4x A53 (MPIDR
+  Aff0), GICv2 node at 0x0b000000/0x0b002000, timer intid to be settled with the kernel
+  baseline, dram-base 0x88000000 + 896 MB (low 128 MB left to stage0/DT/payload), panic
+  log at the top, synthetic 'VIVO' ECID, iPhone7,2 root identity (pending the userland
+  decision). Gotcha found: mkbootimg page-aligns every boot.img section - the stock
+  ramdisk is at 0x7c9000 = align_up(page + kernel_size), not page + kernel_size; the
+  first v15 flash wrote 0x580 bytes early and the loader refused to jump (safe).
+  Images: v15 bad 74f45937...987b, v15 good 50ca5023...a427; commits a118bb9 (pipeline),
+  0b026f8 (page-align fix). mkpayload.py now skips __PAGEZERO (test kernels only).
 - **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
   iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
-  xnu-8796 + iOS 12 userland vs port xnu-4903).
+  xnu-8796 + iOS 12 userland vs port xnu-4903). Note for that choice: msm8916 is GICv2
+  with Qualcomm's remapped timer PPIs, so an iOS 16-class kernel needs GICv2 support
+  added; xnu-4903 (iOS 12) still carries the A8 GICv2 driver. The ADT GIC node shape and
+  the virtual-timer INTID should be taken from a real A8/iOS 12 device tree, not guessed.
 - **Port deltas vs sweet:** 32-bit stage0 (real one) must switch AArch32 EL2 -> AArch64
   (lk2nd-style HCR.RW + eret) and then jump to the AArch64 payload; SDHCI eMMC driver,
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
 - **Next steps:** (1) restore the stock boot.img (needs fastboot); later consider 50 MHz
-  (GPLL0/8 + divider 1); (2) sweet-style payload pipeline (mkpayload) for this device;
-  (3) msm8916 ADT generator; (4) iOS 12 root image into userdata (destructive, confirm
-  first); GICv2 + 1 kHz arch timer done (v14, PPI 19).
+  (GPLL0/8 + divider 1); (2) decide the kernel baseline (xnu-4903 for the GICv2 A8 path
+  vs adding GICv2 to xnu-8796), then plug a real kernel Mach-O into mkpayload.sh - the
+  loader already takes any SWEETXNU blob; (3) settle the GICv2 ADT node from a real
+  A8/iOS 12 device tree; (4) iOS 12 root image into userdata (destructive, confirm
+  first); GICv2 + 1 kHz arch timer done (v14, PPI 19); payload pipeline done (v15).
   BLSP1 UART2 stays a fallback (GCC clocks needed, pins probably not exposed). Reference
   for the SCM path: lk2nd `platform/msm_shared/scm.c` + `app/aboot/aboot.c` (cloned at
   /tmp/lk2nd, not in git).
