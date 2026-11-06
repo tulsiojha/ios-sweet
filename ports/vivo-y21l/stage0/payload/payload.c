@@ -1,5 +1,5 @@
 /*
- * stage0 v10 AArch64 payload: polled ChipIdea USB device-mode console plus
+ * stage0 v11 AArch64 payload: polled ChipIdea USB device-mode console plus
  * an SDHCI eMMC block layer (8-bit/HS switch, multi-block reads, GPT scan).
  *
  * Runs at EL1 with the MMU and caches off, entered at 0x8000a000 by the
@@ -30,9 +30,12 @@
  * ever arrived while GICD/GICC_CTLR bit0 and ISENABLER read back as
  * written - that combination means the payload runs at Secure EL1, so
  * the CNTP timer raises PPI 29 (secure physical timer), not 30. v10
- * enables both and logs which one fires, plus GICD IIDR/TYPER and, on
- * an idle window, CNTP_CTL/HPPIR/RPR. USB and SDCC stay polled; the
- * handler just rearms the timer and counts. Fault vectors decode ESR_EL1.
+ * enabled both: PPI 29 fires, but only about once per 5 s, and CNTP_CTL
+ * sits at ISTATUS=1 between those. v11 runs three 20 s windows (1 ms
+ * rearm, 10 ms rearm, no rearm + masked) and logs the handler's
+ * TVAL/CTL readback plus GICD pending/active to separate a lost rearm
+ * write from a GIC that never re-forwards from QSEE sharing the secure
+ * timer bank. USB and SDCC stay polled. Fault vectors decode ESR_EL1.
  */
 
 #include <stdarg.h>
@@ -870,7 +873,9 @@ static void gic_disable_and_log(void)
 #define TIMER_PPI_S 29		/* secure physical timer PPI */
 
 static volatile u32 g_irq_count, g_irq_other, g_irq_spurious, g_irq_id;
+static volatile u64 g_h_ctl, g_h_tval;	/* CNTP_CTL/TVAL read in handler */
 static u32 g_timer_tval;
+static u32 g_timer_rearm = 1;
 
 /*
  * Called from irq_entry (entry.S), DAIF.I masked. Ack, rearm for the
@@ -886,11 +891,15 @@ void irq_handler(void)
 		return;
 	}
 	if (id == TIMER_PPI_NS || id == TIMER_PPI_S) {
-		__asm__ volatile("msr cntp_tval_el0, %0" ::
-				 "r"((u64)g_timer_tval));
+		if (g_timer_rearm)
+			__asm__ volatile("msr cntp_tval_el0, %0" ::
+					 "r"((u64)g_timer_tval));
 		if (!g_irq_count)
 			g_irq_id = id;
 		g_irq_count++;
+		/* what the timer looks like right after the rearm wrote TVAL */
+		__asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(g_h_ctl));
+		__asm__ volatile("mrs %0, cntp_tval_el0" : "=r"(g_h_tval));
 	} else {
 		g_irq_other++;
 		wr(GICD_BASE + 0x180 + (id / 32) * 4, 1u << (id % 32));
@@ -941,38 +950,46 @@ static void gic_irq_start(void)
 	log_puts("irq: unmasked\n");
 }
 
-/* observed tick rate vs the wall clock, every 5 s */
-static void irq_tick(void)
+/*
+ * Three 20 s windows: A = 1 ms rearm, B = 10 ms rearm, C = no rearm and
+ * CNTP masked. A/B/C counts plus the handler's TVAL readback tell apart
+ * "rearm write ignored" from "GIC never re-forwards" and from QSEE
+ * poking the secure timer bank.
+ */
+static void irq_watch(void)
 {
-	static u32 t0, c0;
+	static u32 t0, c0, phase;
+	u32 ms;
+	u64 ctl, tval;
 
 	if (!g_timer_tval)
 		return;
 	if (!t0) {
 		t0 = ticks();
-		c0 = g_irq_count;
 		return;
 	}
-	if (elapsed_ms(t0) < 5000)
+	ms = elapsed_ms(t0);
+	if (ms < 20000)
 		return;
-	{
-		u32 ms = elapsed_ms(t0);
-
-		if (g_irq_count - c0) {
-			log_printf("irq: %u ticks in %u ms id=%u other=%u spur=%u\n",
-				   g_irq_count - c0, ms, g_irq_id, g_irq_other,
-				   g_irq_spurious);
-		} else {
-			u64 ctl;
-
-			__asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(ctl));
-			log_printf("irq: 0 in %u ms ctl=%lx hppir=%x rpr=%x\n",
-				   ms, ctl, rd(GICC_BASE + 0x18),
-				   rd(GICC_BASE + 0x14));
-		}
-	}
-	t0 = ticks();
+	__asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(ctl));
+	__asm__ volatile("mrs %0, cntp_tval_el0" : "=r"(tval));
+	log_printf("phase %u: %u irq in %u ms h_ctl=%lx h_tval=%lx ctl=%lx tval=%lx\n",
+		   phase, g_irq_count - c0, ms, g_h_ctl, g_h_tval, ctl, tval);
+	log_printf("phase %u: pend0=%x act0=%x isen0=%x hppir=%x rpr=%x\n",
+		   phase, rd(GICD_BASE + 0x200), rd(GICD_BASE + 0x300),
+		   rd(GICD_BASE + 0x100), rd(GICC_BASE + 0x18),
+		   rd(GICC_BASE + 0x14));
 	c0 = g_irq_count;
+	t0 = ticks();
+	phase++;
+	if (phase == 1) {
+		g_timer_tval = (u32)(g_boot_cntfrq / 100);	/* 10 ms */
+		log_puts("phase: rearm -> 10 ms\n");
+	} else if (phase == 2) {
+		g_timer_rearm = 0;
+		__asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(3ull));
+		log_puts("phase: rearm off, timer masked\n");
+	}
 }
 
 static void usb_hw_init(void)
@@ -1776,7 +1793,7 @@ static void boot_replay(void)
 		return;
 	last = ticks();
 
-	log_printf("\n-- v10 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
+	log_printf("\n-- v11 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
 		   g_boot_dtb, g_boot_dtb_ok ? "ok" : "bad",
 		   g_boot_midr, g_boot_cntfrq, g_tick_ms);
 	log_printf("-- wdt_en=%x usb=%s emmc=%s fast=%x irq=%u\n", g_boot_wdt_en,
@@ -1993,7 +2010,7 @@ void kmain(u64 dtb)
 	__asm__ volatile("mrs %0, midr_el1" : "=r"(midr));
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
 
-	log_printf("\nios-sweet vivo Y21L stage0 v10: AArch64 payload\n");
+	log_printf("\nios-sweet vivo Y21L stage0 v11: AArch64 payload\n");
 	g_boot_dtb = dtb;
 	g_boot_cntfrq = cntfrq;
 	g_boot_midr = (u32)midr;
@@ -2029,7 +2046,7 @@ void kmain(u64 dtb)
 		usb_poll();
 		usb_pump();
 		probe_tick();
-		irq_tick();
+		irq_watch();
 		heartbeat();
 		status_tick();
 	}
