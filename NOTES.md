@@ -244,7 +244,12 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   ... is not supported", run dies before step 1); runs 42225191420/42225233484/
   42225368145 died that way. Run 42225474987 (8eedd8f) built and packaged the kernel
   (artifact xnu-4903-kernel 8.43 MB) but exited 2 at lldbmacros, same as the local clean
-  tree; fix above, local `make all` rerun EXIT=0 with no INSTALLPY attempts. The Build
+  tree; fix above, local `make all` rerun EXIT=0 with no INSTALLPY attempts. Run
+  42226803204 (1274660) is the first FULL SUCCESS: all 7 steps green in ~7 min
+  (patch apply, build, package, mkpayload smoke test, artifact). Artifact
+  xnu-4903-kernel 14,905,541 B zip, expires 2026-11-13; the REST artifact download
+  returns 401 without auth, so use the Actions UI when signed in or the local
+  BUILD/obj/DEVELOPMENT_ARM64_T7000/kernel.development.t7000. The Build
   step now tees `build.log` and the artifact includes it (unauth users cannot read job
   logs; artifact logs are the only way to see failures). CI auth: origin dipa-studio is
   HTTPS and this Mac has no credential, SSH authenticates as tulsiojha (no write on
