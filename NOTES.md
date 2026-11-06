@@ -300,6 +300,30 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   `ports/vivo-y21l/out/vivo-boot-usbcon.img` 29,154,538 B, sha256
   6612ac38...156d (payload 10,216,896 B, kernel_end 0xfffffff007a64000, ADT at the
   same place as before). NOT yet flashed.
+- **xnu-4903 BOOT TEST v17 (2026-11-06): usbcon image flashed; xnu dies before
+  serial_init - Apple-only CPU registers in start.s.** Image
+  out/vivo-boot-usbcon.img (6612ac38...156d) flashed OKAY, reboot: stage0 ran the
+  usual probe and jumped (log /tmp/usbcon-boot.log, 6809 B, ends at "jumping to
+  00000000890f90a0"). OBSERVATION: afterwards macOS still lists the device as
+  "vivo Y21L stage0" (VID 0x1209, address 1) and the tty reads 0 bytes - the xnu
+  "vivo Y21L xnu" descriptor never appeared, so usbcon_init() never ran (a
+  controller reset would have forced a re-enumeration; stage0 proved that path).
+  Root cause, from source: with MACHINE_CONFIGS=T7000 the board config defines
+  APPLE_ARM64_ARCH_FAMILY and APPLETYPHOON, and osfmk/arm64/start.s then executes
+  Apple-only SPR accesses (HID0/1/3/5/8, EHID4 via ARM64_READ_EP_SPR) BEFORE the
+  MMU and VBAR are set. On a Cortex-A53 those encodings are undefined (IMPLDEF)
+  and trap straight into whatever vector stage0 left - no output, no reset.
+  pmap/arm_vm_init/machine_routines contain no Apple SPR use, KTRR paths are off
+  (T7000 = KERNEL_INTEGRITY_WT), pe_identify_machine returns early when
+  pe_arm_get_soc_base_phys()==0 (no Apple soc node in our ADT), and T7000 is 4 KB
+  pages (A8), which A53 supports - so start.s is the only A53-fatal code found.
+  FIX (in the patch): `options MSM8916_PORT` in config/MASTER.arm64 and
+  `&& !defined(MSM8916_PORT)` on the two start.s blocks active for T7000
+  (APPLE_ARM64_ARCH_FAMILY HID4 tweak, APPLECYCLONE||APPLETYPHOON tunables).
+  Verified in the rebuilt start.o: zero IMPDEF `s3_*` sysreg instructions left.
+  New image `ports/vivo-y21l/out/vivo-boot-msmport.img` 29,154,538 B, sha256
+  fa804e87...0ff1 (kernel size unchanged at 10,210,024 B because segment sizes are
+  page-rounded). Ready to flash.
   CI: `.github/workflows/xnu-4903.yml` (commit 8eedd8f) applies the patch to a fresh
   494ffe1 clone and builds on `macos-15-intel`. `macos-14` now resolves to
   `macos-14-arm64-us-default`, a configuration this repo cannot use ("The configuration

@@ -56,15 +56,16 @@ index 73b2db4..df474b6 100755
 +    print("        {0x%x, \"%s\"}," % mapping)
 +print("};")
 diff --git a/config/MASTER.arm64 b/config/MASTER.arm64
-index eadc388..99e81dc 100644
+index eadc388..5837c64 100644
 --- a/config/MASTER.arm64
 +++ b/config/MASTER.arm64
-@@ -73,6 +73,8 @@ machine		"arm64"						# <arm64>
+@@ -73,6 +73,9 @@ machine		"arm64"						# <arm64>
  makeoptions	OSFMK_MACHINE = "arm64"				# <mach>
  
  options		COUNT_SYSCALLS		# count bsd system calls 	# <countcalls>
 +options		MONOTONIC		# fixed counters (machine/monotonic.h uses MT_CORE_NFIXED)
 +options		SHMCON			# shared-memory kprintf ring in the panic area (stage0 dumps it)
++options		MSM8916_PORT		# vivo Y21L port: skip Apple-only CPU register pokes
  options     TRASH_VFP_ON_SAVE   # <debug,trash_vfp>
  options		ALTERNATE_DEBUGGER	# <alternate_debugger>
  
@@ -348,6 +349,28 @@ index 6a8d109..422d367 100644
  #endif /* __ARM_KERNEL_PROTECT__ */
  
  	.text
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index f709217..b69f9b0 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -747,7 +747,7 @@ common_start:
+ 	mov		x0, #0
+ 	msr		TPIDR_EL1, x0						// Set thread register
+ 
+-#if defined(APPLE_ARM64_ARCH_FAMILY)
++#if defined(APPLE_ARM64_ARCH_FAMILY) && !defined(MSM8916_PORT)
+ 	// Initialization common to all Apple targets
+ 	ARM64_IS_PCORE x15
+ 	ARM64_READ_EP_SPR x15, x12, ARM64_REG_EHID4, ARM64_REG_HID4
+@@ -756,7 +756,7 @@ common_start:
+ 	ARM64_WRITE_EP_SPR x15, x12, ARM64_REG_EHID4, ARM64_REG_HID4
+ #endif  // APPLE_ARM64_ARCH_FAMILY
+ 
+-#if defined(APPLECYCLONE) || defined(APPLETYPHOON)
++#if (defined(APPLECYCLONE) || defined(APPLETYPHOON)) && !defined(MSM8916_PORT)
+ 	//
+ 	// Cyclone/Typhoon-Specific initialization
+ 	// For tunable summary, see <rdar://problem/13503621> Alcatraz/H6: Confirm Cyclone CPU tunables have been set
 diff --git a/osfmk/conf/Makefile.template b/osfmk/conf/Makefile.template
 index d296cb6..d9d5953 100644
 --- a/osfmk/conf/Makefile.template
