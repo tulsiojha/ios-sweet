@@ -41,6 +41,24 @@ Second target, separate from sweet. Phone serial c25ac45b; DTB copied to `vivo.d
   51042586...35b1 restores Android, boots in ~15 s) -> `fastboot reboot` ->
   `adb reboot bootloader` returns to fastboot. Repacks via `tools/vivo-repack-boot.py`
   (replaces kernel area only; ramdisk/QCDT/trailing PKCS#7 untouched).
+- **USB LOG CONSOLE WORKS (2026-11-06, stage0 v5):** the AArch64 payload brings up the
+  ChipIdea device from scratch and macOS enumerates it as "vivo Y21L stage0" (1209:0001,
+  CDC-ACM serial, high speed, bcdUSB 2.00); `/dev/tty.usbmodemY21L_00011` streams the log
+  ring (1 s `hb` heartbeats with a drops counter, `setup` trace). Implementation in
+  `ports/vivo-y21l/stage0/payload/payload.c`: GCC USB clocks at 80 MHz from GPLL0
+  (CFG_RCGR 0x01841014 = src 1 div 19, CMD update poll, CBCR 0x01841008/0x01841004, BCR
+  0x01841000 pulse, same order as LK `hsusb_clock_init`), ULPI viewport @0x78d9170, LK
+  `target_usb_init` VBUS override (ULPI 0x97=0x03, GENCONFIG_2 bit7, USBCMD bit25),
+  polled EP0 state machine using LK's qH/TD layout (QH list 4K-aligned, setup packet at
+  QH0+0x28, IOS on EP0 OUT), descriptor patch for FS/HS max packet, bulk-IN EP3 as the log
+  pipe. Before touching USB it disables the APPS WDT (0xB017000, kpss layout: kick 0x4,
+  EN 0x8; payload ran >2 min without a bite) and the GIC (0xB000000/0xB002000), with DAIF
+  masked and a fault vector table only for diagnostics. Sources entry.S/payload.ld/payload.c,
+  build.sh links them with rust-lld at 0x8000a000; blob `out/stage0v5.bin` (arm32 stub
+  264 B + payload 14,313 B), image `device-info/vivo-stock/vivo-test5-boot.img` (sha256
+  495b9a46...ae2d). Observations: macOS re-sends SET_LINE_CODING a few times when the tty
+  opens (benign, data flows); on tty close a pending bulk-IN chunk is dropped after the 5 s
+  tx3 timeout (v5 quirk - retry the chunk instead of flushing in the next build).
 - **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
   iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
   xnu-8796 + iOS 12 userland vs port xnu-4903).
@@ -49,13 +67,13 @@ Second target, separate from sweet. Phone serial c25ac45b; DTB copied to `vivo.d
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) restore stock boot.img; (2) AArch64 bring-up payload: first a logging
-  channel - USB device mode (ChipIdea HSUSB @0x78d9000) is the only certain external port;
-  BLSP1 UART2 needs GCC clocks (regs TBD) and the pins are probably not exposed; (3) GICv2 +
-  timer + exception vectors in the A64 payload; (4) SDHCI eMMC driver (needed for the root
-  image anyway); (5) sweet-style payload pipeline (mkpayload) for this device; (6) ADT
-  generator. Reference for the SCM path: lk2nd `platform/msm_shared/scm.c` +
-  `app/aboot/aboot.c` (cloned at /tmp/lk2nd, not in git).
+- **Next steps:** (1) A64 payload improvements: keep the pending bulk-IN chunk across host
+  read stalls (v5 flushes it after 5 s) and keep a boot-info blob for replay; add GICv2 +
+  timer + exception handling (IRQs stay masked and the GIC off until then); (2) SDHCI eMMC
+  driver (needed for the root image anyway); (3) sweet-style payload pipeline (mkpayload)
+  for this device; (4) ADT generator. BLSP1 UART2 stays a fallback (GCC clocks needed,
+  pins probably not exposed). Reference for the SCM path: lk2nd `platform/msm_shared/scm.c`
+  + `app/aboot/aboot.c` (cloned at /tmp/lk2nd, not in git).
 - This Mac session has no cross gcc + no gh CLI; kernel builds still go through the public
   repo's GitHub Actions (`dipa-studio/ios-sweet`).
 
