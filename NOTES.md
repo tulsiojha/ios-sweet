@@ -408,6 +408,32 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   applies clean to a fresh 494ffe1 clone). NOT yet flashed: after the v19 test
   the phone dropped off USB entirely (no fastboot, no tty, no stage0 device in
   ioreg) and needs the user to power it back into fastboot.
+- **v20 TEST (2026-11-06 23:03): OSLAR skip did NOT fix it; `el=1` confirmed.**
+  out/vivo-boot-oslarfix.img (c28be0c2...c81f) flashed OKAY; stage0 log
+  (/tmp/vivo-v20.log) ends `loader: jumping to 00000000890f90a0 el=...1`, then no
+  xnu output, and the USB device stayed "vivo Y21L stage0" at kUSBAddress 1 - the
+  controller was never reset, so usbcon_early_start still never ran (or died inside
+  its clock init before the USBCMD reset). Deeper audit, no smoking gun: (a) the
+  loader's boot_args struct is the sweet (xnu-8796) 736-byte layout with
+  CommandLine[608], but xnu-4903 arm64 uses CommandLine[256] / sizeof 384
+  (pexpert/pexpert/arm64/boot.h) - every field start.s and arm_init read
+  (virtBase 8, physBase 16, memSize 24, topOfKernelData 32, deviceTreeP 96,
+  deviceTreeLength 104, cmdline at 108) has the same offset, and bootFlags (368)
+  / memSizeActual (376) just read zeros, so this is a latent mismatch to clean
+  up later, NOT this hang; (b) MAIR decodes to attr3 = 0x00 = Device nGnRnE (the
+  GCC/USB/QGIC blocks are strongly ordered as intended); (c) the V=P and KVA
+  bootstrap tables, TCR 0x22A51A251A (IPS 40-bit, TG 4K, TZ 26), SCTLR 0x3454593d
+  and the adrp-as-PA trick were all re-verified in the v20 binary. Since static
+  analysis is exhausted, the next step is an observable beacon.
+- **BEACON DIAGNOSTIC (v21, built, NOT yet flashed): is arm_init reached at all?**
+  Added to start.s a 4th V=P device block for 0x00400000 (PS_HOLD, L2 index 2) and
+  a TEMPORARY (uncommitted) arm_init prologue: `*(volatile uint32_t *)0x004ab000 =
+  0; for(;;);` under MSM8916_PORT. The qcom,pshold write is the proven stage0 v3
+  power-off beacon. Reading: phone powers off a second or two after the jump ->
+  start.s completed and C code runs (the hang is then in the early-console init);
+  phone stays in the dead stage0-USB state -> the hang is inside start.s.
+  Image `out/vivo-boot-beacon1.img` 29,154,538 B, sha256 0d5cfce3...6071. The
+  temporary beacon must be reverted before the next real image and patch push.
   CI: `.github/workflows/xnu-4903.yml` (commit 8eedd8f) applies the patch to a fresh
   494ffe1 clone and builds on `macos-15-intel`. `macos-14` now resolves to
   `macos-14-arm64-us-default`, a configuration this repo cannot use ("The configuration
