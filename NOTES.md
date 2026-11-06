@@ -21,6 +21,22 @@ Second target, separate from sweet. Phone serial c25ac45b; DTB copied to `vivo.d
   v1/v2 (UART write first, TXRDY poll at 0x78b0000) hung at the logo - do NOT touch BLSP1
   UART before enabling its clocks. Image `device-info/vivo-stock/vivo-test3-boot.img`
   (sha256 48aea799...607e). LK jumps in AArch32 at EL2 (msm8916 boots Linux into HYP mode).
+- **AARCH64 RUNS (2026-11-06, stage0 v4): logo boot loop confirmed on hardware.** The ARM32
+  stub sends the secure-monitor "milestone 32->64" call that this LK itself uses for 64-bit
+  kernels (`scm_elexec_call` in emmc_appsboot.mbn @0x8f6138c0, lifted by disassembly):
+  call2 encoding `r0=0x0200010f, r1=0x12, r2=&param, r3=0x50, r4-r6=0`; if it returns,
+  legacy QSEE `scm_command` @0x80009400 (len 104, buf_off 16, resp_off 96, id 0x40f) with
+  `r0=1, r1=&ctx, r2=cmd`; both `smc #0` (0xe1600070). Param = 10 x u64, `[+0]=dtb`,
+  `[+0x48]=a64 entry` (same as lk2nd's el1_system_param). QSEE erets to AArch64 EL1 at
+  0x8000a000 with x0=dtb; the A64 stub writes pshold -> power off loop. Sources
+  `ports/vivo-y21l/stage0/stub4_arm32.S` + `stub4_a64.S` (build.sh concatenates; A64 at
+  blob offset 0x2000), image `device-info/vivo-stock/vivo-test4-boot.img` (sha256
+  329ce53a...c258). Stub notes: llvm-mc needs the raw `.inst 0xe1600070` for `smc #0`
+  (`+trustzone` feature isn't honored) and `bl` to a symbol leaves a relocation in a flat
+  binary -> inline helpers or use resolved local branches. `ldr =` literals are fine.
+- **Payload budget:** LK loads `kernel_size` bytes to 0x80008000; ramdisk loads at
+  0x82000000, so an enlarged kernel area can carry up to ~32 MB of our own payload inside
+  the boot image (no eMMC driver needed to bootstrap).
 - **Test loop (all verified):** `fastboot flash boot <img>` (stock boot.img sha256
   51042586...35b1 restores Android, boots in ~15 s) -> `fastboot reboot` ->
   `adb reboot bootloader` returns to fastboot. Repacks via `tools/vivo-repack-boot.py`
@@ -33,11 +49,13 @@ Second target, separate from sweet. Phone serial c25ac45b; DTB copied to `vivo.d
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) restore stock boot.img (user in fastboot); (2) write stage0 v4 =
-  real diagnostic: enable UART clocks (GCC) or skip UART, print to screen by taking over
-  the DSI command-mode link is HARD - better: enable UART2 clocks via GCC and log at
-  115200; (3) EL2->AArch64 switch + tiny AArch64 payload that writes pshold (proves EL1);
-  (4) sweet-style payload pipeline (mkpayload) for this device; (5) SDHCI + GICv2 + ADT.
+- **Next steps:** (1) restore stock boot.img; (2) AArch64 bring-up payload: first a logging
+  channel - USB device mode (ChipIdea HSUSB @0x78d9000) is the only certain external port;
+  BLSP1 UART2 needs GCC clocks (regs TBD) and the pins are probably not exposed; (3) GICv2 +
+  timer + exception vectors in the A64 payload; (4) SDHCI eMMC driver (needed for the root
+  image anyway); (5) sweet-style payload pipeline (mkpayload) for this device; (6) ADT
+  generator. Reference for the SCM path: lk2nd `platform/msm_shared/scm.c` +
+  `app/aboot/aboot.c` (cloned at /tmp/lk2nd, not in git).
 - This Mac session has no cross gcc + no gh CLI; kernel builds still go through the public
   repo's GitHub Actions (`dipa-studio/ios-sweet`).
 
