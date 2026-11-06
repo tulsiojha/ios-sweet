@@ -189,7 +189,7 @@ static void log_putc(char c)
 	g_ring_w = n;
 }
 
-static void log_puts(const char *s)
+void log_puts(const char *s)
 {
 	while (*s)
 		log_putc(*s++);

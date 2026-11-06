@@ -56,14 +56,15 @@ index 73b2db4..df474b6 100755
 +    print("        {0x%x, \"%s\"}," % mapping)
 +print("};")
 diff --git a/config/MASTER.arm64 b/config/MASTER.arm64
-index eadc388..95e5625 100644
+index eadc388..99e81dc 100644
 --- a/config/MASTER.arm64
 +++ b/config/MASTER.arm64
-@@ -73,6 +73,7 @@ machine		"arm64"						# <arm64>
+@@ -73,6 +73,8 @@ machine		"arm64"						# <arm64>
  makeoptions	OSFMK_MACHINE = "arm64"				# <mach>
  
  options		COUNT_SYSCALLS		# count bsd system calls 	# <countcalls>
 +options		MONOTONIC		# fixed counters (machine/monotonic.h uses MT_CORE_NFIXED)
++options		SHMCON			# shared-memory kprintf ring in the panic area (stage0 dumps it)
  options     TRASH_VFP_ON_SAVE   # <debug,trash_vfp>
  options		ALTERNATE_DEBUGGER	# <alternate_debugger>
  
@@ -360,6 +361,822 @@ index d296cb6..d9d5953 100644
  
  ${SOBJS}: assym.s
  
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 3e70e3f..61bdbe8 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -220,6 +220,774 @@ static struct pe_serial_functions dcc_serial_functions = {
+ 
+ /*****************************************************************************/
+ 
++#if defined(__arm64__)
++
++/*
++ * Device-mode USB console for msm8916 (vivo Y21L bring-up port).
++ *
++ * Polled ChipIdea device controller in CDC-ACM mode, same protocol the
++ * stage0 loader already proved against macOS: EP0 enumeration, bulk IN
++ * console data on EP3, no interrupts. Selected with the "usbcon" boot-arg.
++ *
++ * The T7000 machine config defines __ARM_COHERENT_IO__ (true for Apple's
++ * fabric, false for msm8916), which compiles the arm cache helpers into
++ * no-ops, so the descriptors and buffers below are maintained with
++ * explicit dc civac here. All DMA memory lives in one 16 KB-aligned
++ * static page so each 4 KB sub-block the controller can address is
++ * physically contiguous.
++ */
++
++#define USBCON_USB_PA           0x078d9000u
++#define USBCON_GCC_PA           0x01841000u
++#define USBCON_MAP_SIZE         0x1000u
++
++#define USBCON_SBUSCFG          0x090
++#define USBCON_AHB_MODE         0x098
++#define USBCON_GENCONFIG_2      0x0a0
++#define USBCON_CAPLENGTH        0x100
++#define USBCON_USBCMD           0x140
++#define USBCON_USBSTS           0x144
++#define USBCON_USBINTR          0x148
++#define USBCON_DEVICEADDR       0x154
++#define USBCON_ENDPOINTLISTADDR 0x158
++#define USBCON_ULPI_VIEWPORT    0x170
++#define USBCON_PORTSC           0x184
++#define USBCON_USBMODE          0x1a8
++#define USBCON_ENDPTSETUPSTAT   0x1ac
++#define USBCON_ENDPTPRIME       0x1b0
++#define USBCON_ENDPTFLUSH       0x1b4
++#define USBCON_ENDPTCOMPLETE    0x1bc
++#define USBCON_ENDPTCTRL(n)     (0x1c0 + 4 * (n))
++
++#define USBCON_CMD_RUN          0x00080001u
++#define USBCON_CMD_RESET        0x00080002u
++
++#define USBCON_STS_URI          (1u << 6)
++#define USBCON_STS_PCI          (1u << 2)
++#define USBCON_STS_UEI          (1u << 1)
++#define USBCON_STS_UI           (1u << 0)
++
++#define USBCON_EPT_TX(n)        (1u << ((n) + 16))
++#define USBCON_EPT_RX(n)        (1u << (n))
++
++#define USBCON_CTRL_TXE         (1u << 23)
++#define USBCON_CTRL_TXR         (1u << 22)
++#define USBCON_CTRL_TXS         (1u << 16)
++#define USBCON_CTRL_RXE         (1u << 7)
++#define USBCON_CTRL_RXR         (1u << 6)
++#define USBCON_CTRL_RXS         (1u << 0)
++#define USBCON_CTRL_TXT_BULK    (2u << 18)
++
++#define USBCON_CONFIG_ZLT       (1u << 29)
++#define USBCON_CONFIG_IOS       (1u << 15)
++#define USBCON_INFO_IOC         (1u << 15)
++#define USBCON_INFO_ACTIVE      (1u << 7)
++
++#define USBCON_ULPI_MISC_A      0x96
++#define USBCON_ULPI_MISC_A_SET  0x97
++#define USBCON_ULPI_VBUSVLDEXTSEL (1u << 1)
++#define USBCON_ULPI_VBUSVLDEXT  (1u << 0)
++
++#define USBCON_RING_SIZE        32768
++#define USBCON_DMA_ALIGN        16384
++#define USBCON_CACHE_LINE       64
++
++struct usbcon_qh {
++	uint32_t config;
++	uint32_t current;
++	uint32_t next;
++	uint32_t info;
++	uint32_t page0, page1, page2, page3, page4;
++	uint32_t reserved0;
++	uint8_t  setup[8];
++	uint32_t reserved1, reserved2, reserved3, reserved4;
++};
++
++struct usbcon_td {
++	uint32_t next;
++	uint32_t info;
++	uint32_t page0, page1, page2, page3, page4;
++	uint32_t reserved;
++};
++
++struct usbcon_dma {
++	struct usbcon_qh qh[32];
++	struct usbcon_td td_ep0in;
++	struct usbcon_td td_ep0out;
++	struct usbcon_td td_ep3;
++	uint8_t  ep0_buf[4096];
++	uint8_t  tx_buf[4096];
++} __attribute__((aligned(USBCON_DMA_ALIGN)));
++
++static struct usbcon_dma usbcon_dma;
++_Static_assert(sizeof(struct usbcon_qh) == 64, "ChipIdea qH layout");
++_Static_assert(sizeof(struct usbcon_td) == 32, "ChipIdea dTD layout");
++_Static_assert(sizeof(struct usbcon_dma) <= USBCON_DMA_ALIGN,
++    "DMA block must fit one 16 KB page");
++
++static vm_offset_t usbcon_base;
++static vm_offset_t usbcon_gcc;
++static vm_offset_t usbcon_dma_pa;
++
++static uint8_t usbcon_ring[USBCON_RING_SIZE];
++static uint32_t usbcon_ring_r, usbcon_ring_w;
++
++static int usbcon_configured;
++static uint32_t usbcon_config_value;
++static int usbcon_tx_busy;
++static uint32_t usbcon_tx_len;
++static uint64_t usbcon_tx_start_ms;
++
++static int usbcon_ep0_state;
++enum {
++	USBCON_EP0_IDLE,
++	USBCON_EP0_DATA_IN,
++	USBCON_EP0_STATUS_IN,
++	USBCON_EP0_STATUS_OUT,
++	USBCON_EP0_DATA_OUT,
++};
++
++static inline uint32_t
++usbcon_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(usbcon_base + off);
++}
++
++static inline void
++usbcon_wr(uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(usbcon_base + off) = val;
++}
++
++static inline uint64_t
++usbcon_ticks(void)
++{
++	uint64_t v;
++
++	__asm__ volatile ("mrs %0, cntpct_el0" : "=r" (v));
++	return v;
++}
++
++static uint64_t
++usbcon_now_ms(void)
++{
++	uint64_t frq;
++
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (frq));
++	if (frq == 0) {
++		frq = 19200000;
++	}
++	return usbcon_ticks() / (frq / 1000);
++}
++
++static void
++usbcon_delay_ms(uint32_t ms)
++{
++	uint64_t t0 = usbcon_ticks();
++	uint64_t frq;
++
++	__asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (frq));
++	if (frq == 0) {
++		frq = 19200000;
++	}
++	while (usbcon_ticks() - t0 < (uint64_t)ms * (frq / 1000)) {
++		;
++	}
++}
++
++static void
++usbcon_wait_clear(uint32_t off, uint32_t mask, uint32_t spins)
++{
++	while ((usbcon_rd(off) & mask) && spins--) {
++		;
++	}
++}
++
++/* Clean+invalidate by VA: msm8916 DMA is not coherent and the arm64
++ * helpers are no-ops in this build (__ARM_COHERENT_IO__). */
++static void
++usbcon_dcache_sync(void *addr, uint32_t len)
++{
++	uintptr_t a = (uintptr_t)addr & ~(uintptr_t)(USBCON_CACHE_LINE - 1);
++	uintptr_t end = ((uintptr_t)addr + len + USBCON_CACHE_LINE - 1)
++	    & ~(uintptr_t)(USBCON_CACHE_LINE - 1);
++
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (; a < end; a += USBCON_CACHE_LINE) {
++		__asm__ volatile ("dc civac, %0" :: "r" (a) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++usbcon_ulpi_write(uint32_t reg, uint32_t val)
++{
++	uint32_t n = 1000000;
++
++	usbcon_wr(USBCON_ULPI_VIEWPORT,
++	    (1u << 30) | (1u << 29) | ((reg & 0xff) << 16) | (val & 0xff));
++	while ((usbcon_rd(USBCON_ULPI_VIEWPORT) & (1u << 30)) && n--) {
++		;
++	}
++}
++
++static void
++usbcon_qh_prime(uint32_t ep, uint32_t in, struct usbcon_td *td,
++    const void *buf, uint32_t len)
++{
++	uint32_t addr = (uint32_t)ml_vtophys((vm_offset_t)buf);
++	uint32_t base = addr & ~0xfffu;
++	struct usbcon_qh *h = &usbcon_dma.qh[ep * 2 + in];
++
++	td->next = 1;           /* TERMINATE */
++	td->info = (len << 16) | USBCON_INFO_IOC | USBCON_INFO_ACTIVE;
++	td->page0 = addr;
++	td->page1 = base + 0x1000;
++	td->page2 = base + 0x2000;
++	td->page3 = base + 0x3000;
++	td->page4 = base + 0x4000;
++	td->reserved = 0;
++
++	h->next = (uint32_t)ml_vtophys((vm_offset_t)td);
++	h->info = 0;
++
++	usbcon_dcache_sync(td, sizeof(*td));
++	usbcon_dcache_sync(h, sizeof(*h));
++	usbcon_wr(USBCON_ENDPTPRIME, in ? USBCON_EPT_TX(ep) : USBCON_EPT_RX(ep));
++}
++
++static int
++usbcon_bus_highspeed(void)
++{
++	return ((usbcon_rd(USBCON_PORTSC) >> 26) & 3) == 2;
++}
++
++static void
++usbcon_ep0_status_in(void)
++{
++	usbcon_qh_prime(0, 1, &usbcon_dma.td_ep0in, usbcon_dma.ep0_buf, 0);
++	usbcon_ep0_state = USBCON_EP0_STATUS_IN;
++}
++
++static void
++usbcon_ep0_status_out(void)
++{
++	usbcon_qh_prime(0, 0, &usbcon_dma.td_ep0out, usbcon_dma.ep0_buf, 0);
++	usbcon_ep0_state = USBCON_EP0_STATUS_OUT;
++}
++
++static void
++usbcon_ep0_recv(uint32_t maxlen)
++{
++	if (maxlen > sizeof(usbcon_dma.ep0_buf)) {
++		maxlen = sizeof(usbcon_dma.ep0_buf);
++	}
++	usbcon_qh_prime(0, 0, &usbcon_dma.td_ep0out, usbcon_dma.ep0_buf, maxlen);
++	usbcon_ep0_state = USBCON_EP0_DATA_OUT;
++}
++
++static void
++usbcon_ep0_send(const uint8_t *data, uint32_t len, uint32_t wlen)
++{
++	if (len > wlen) {
++		len = wlen;
++	}
++	if (len > sizeof(usbcon_dma.ep0_buf)) {
++		len = sizeof(usbcon_dma.ep0_buf);
++	}
++	if (len) {
++		memcpy(usbcon_dma.ep0_buf, data, len);
++	}
++	usbcon_dcache_sync(usbcon_dma.ep0_buf, len);
++	usbcon_qh_prime(0, 1, &usbcon_dma.td_ep0in, usbcon_dma.ep0_buf, len);
++	usbcon_ep0_state = len ? USBCON_EP0_DATA_IN : USBCON_EP0_STATUS_IN;
++}
++
++static void
++usbcon_ep0_stall(void)
++{
++	usbcon_wr(USBCON_ENDPTCTRL(0),
++	    usbcon_rd(USBCON_ENDPTCTRL(0)) | USBCON_CTRL_TXS | USBCON_CTRL_RXS);
++	usbcon_ep0_state = USBCON_EP0_IDLE;
++}
++
++static const uint8_t usbcon_dev_desc[18] = {
++	0x12, 0x01, 0x00, 0x02, 0x02, 0x00, 0x00, 0x40,
++	0x09, 0x12,             /* idVendor 0x1209 */
++	0x01, 0x00,             /* idProduct 0x0001 */
++	0x00, 0x01,             /* bcdDevice 1.00 */
++	0x01, 0x02, 0x03,       /* iManufacturer, iProduct, iSerial */
++	0x01,                   /* bNumConfigurations */
++};
++
++#define USBCON_CONFIG_DESC_LEN 67
++static uint8_t usbcon_config_desc[USBCON_CONFIG_DESC_LEN] = {
++	0x09, 0x02, 0x43, 0x00, 0x02, 0x01, 0x00, 0x80, 0x32,
++	/* CDC communication interface, ACM */
++	0x09, 0x04, 0x00, 0x00, 0x01, 0x02, 0x02, 0x01, 0x00,
++	0x05, 0x24, 0x00, 0x10, 0x01,             /* header */
++	0x05, 0x24, 0x01, 0x00, 0x01,             /* call management */
++	0x04, 0x24, 0x02, 0x02,                    /* ACM */
++	0x05, 0x24, 0x06, 0x00, 0x01,             /* union */
++	0x07, 0x05, 0x81, 0x03, 0x10, 0x00, 0x10, /* EP1 IN int */
++	/* CDC data interface */
++	0x09, 0x04, 0x01, 0x00, 0x02, 0x0a, 0x00, 0x00, 0x00,
++	0x07, 0x05, 0x02, 0x02, 0x00, 0x02, 0x00, /* EP2 OUT bulk */
++	0x07, 0x05, 0x83, 0x02, 0x00, 0x02, 0x00, /* EP3 IN bulk */
++};
++
++static const uint8_t usbcon_qual_desc[10] = {
++	0x0a, 0x06, 0x00, 0x02, 0x02, 0x00, 0x00, 0x40, 0x01, 0x00,
++};
++
++static const uint8_t usbcon_str_lang[4] = { 0x04, 0x03, 0x09, 0x04 };
++static uint8_t usbcon_str_mfr[2 + 64], usbcon_str_prod[2 + 64],
++    usbcon_str_ser[2 + 64];
++static uint32_t usbcon_str_mfr_len, usbcon_str_prod_len, usbcon_str_ser_len;
++
++static void
++usbcon_build_string(uint8_t *dst, uint32_t *lenp, const char *s)
++{
++	uint32_t n = 0, i;
++
++	while (s[n] && n < 32) {
++		n++;
++	}
++	dst[0] = (uint8_t)(2 + n * 2);
++	dst[1] = 0x03;
++	for (i = 0; i < n; i++) {
++		dst[2 + 2 * i] = (uint8_t)s[i];
++		dst[3 + 2 * i] = 0;
++	}
++	*lenp = 2 + n * 2;
++}
++
++static void
++usbcon_patch_config_desc(void)
++{
++	uint32_t mp = usbcon_bus_highspeed() ? 512 : 64;
++
++	usbcon_config_desc[57] = (uint8_t)(mp & 0xff);
++	usbcon_config_desc[58] = (uint8_t)(mp >> 8);
++	usbcon_config_desc[64] = (uint8_t)(mp & 0xff);
++	usbcon_config_desc[65] = (uint8_t)(mp >> 8);
++}
++
++static void
++usbcon_set_config(uint32_t v)
++{
++	if (v) {
++		uint32_t mp = usbcon_bus_highspeed() ? 512 : 64;
++
++		usbcon_dma.qh[7].config = (mp << 16) | USBCON_CONFIG_ZLT;
++		usbcon_wr(USBCON_ENDPTCTRL(3),
++		    usbcon_rd(USBCON_ENDPTCTRL(3)) |
++		    USBCON_CTRL_TXE | USBCON_CTRL_TXR | USBCON_CTRL_TXT_BULK);
++		usbcon_dcache_sync(&usbcon_dma.qh[7], sizeof(struct usbcon_qh));
++		usbcon_configured = 1;
++	} else {
++		usbcon_wr(USBCON_ENDPTCTRL(3), 0);
++		usbcon_configured = 0;
++		usbcon_tx_busy = 0;
++	}
++	usbcon_config_value = v;
++}
++
++static void
++usbcon_handle_setup(void)
++{
++	uint8_t s[8];
++	uint8_t type, req;
++	uint16_t val, idx, len;
++	uint32_t dtype, dnum;
++
++	usbcon_dcache_sync(&usbcon_dma.qh[0], sizeof(struct usbcon_qh));
++	memcpy(s, usbcon_dma.qh[0].setup, 8);
++	usbcon_wr(USBCON_ENDPTSETUPSTAT, USBCON_EPT_RX(0));
++
++	type = s[0];
++	req = s[1];
++	val = (uint16_t)(s[2] | (s[3] << 8));
++	idx = (uint16_t)(s[4] | (s[5] << 8));
++	len = (uint16_t)(s[6] | (s[7] << 8));
++
++	if ((type & 0x60) == 0x20) {            /* CDC class requests */
++		if (!(type & 0x80)) {
++			if (len) {
++				usbcon_ep0_recv(len);
++			} else {
++				usbcon_ep0_status_in();
++			}
++		} else if (req == 0x21) {       /* GET_LINE_CODING */
++			static const uint8_t lc[7] = {
++				0x00, 0xc2, 0x01, 0x00, 0x00, 0x00, 0x08
++			};
++			usbcon_ep0_send(lc, sizeof(lc), len);
++		} else {
++			usbcon_ep0_stall();
++		}
++		return;
++	}
++
++	if ((type & 0x60) != 0) {               /* vendor requests: ack */
++		usbcon_ep0_status_in();
++		return;
++	}
++
++	switch (req) {
++	case 0x00: {                            /* GET_STATUS */
++		static const uint8_t z[2] = { 0, 0 };
++		usbcon_ep0_send(z, 2, len);
++		return;
++	}
++	case 0x01:                              /* CLEAR_FEATURE */
++		if ((type & 0x1f) == 2 && (idx & 0x80) && (idx & 0xf) == 3) {
++			uint32_t c = usbcon_rd(USBCON_ENDPTCTRL(3));
++
++			if (c & USBCON_CTRL_TXS) {
++				usbcon_wr(USBCON_ENDPTCTRL(3), c | USBCON_CTRL_TXS);
++			}
++		}
++		usbcon_ep0_status_in();
++		return;
++	case 0x03:                              /* SET_FEATURE */
++		usbcon_ep0_status_in();
++		return;
++	case 0x05:                              /* SET_ADDRESS */
++		usbcon_wr(USBCON_DEVICEADDR,
++		    ((uint32_t)val << 25) | (1u << 24));
++		usbcon_ep0_status_in();
++		return;
++	case 0x06:                              /* GET_DESCRIPTOR */
++		break;
++	case 0x08:                              /* GET_CONFIGURATION */
++		if (val == 0 && idx == 0 && len == 1) {
++			uint8_t v = (uint8_t)usbcon_config_value;
++
++			usbcon_ep0_send(&v, 1, 1);
++		} else {
++			usbcon_ep0_stall();
++		}
++		return;
++	case 0x09:                              /* SET_CONFIGURATION */
++		usbcon_set_config(val);
++		usbcon_ep0_status_in();
++		return;
++	case 0x0a: {                            /* GET_INTERFACE */
++		static const uint8_t z = 0;
++
++		usbcon_ep0_send(&z, 1, len);
++		return;
++	}
++	default:
++		usbcon_ep0_stall();
++		return;
++	}
++
++	dtype = val >> 8;
++	dnum = val & 0xff;
++	switch (dtype) {
++	case 0x01:
++		usbcon_ep0_send(usbcon_dev_desc, sizeof(usbcon_dev_desc), len);
++		return;
++	case 0x02:
++		usbcon_patch_config_desc();
++		usbcon_ep0_send(usbcon_config_desc, sizeof(usbcon_config_desc), len);
++		return;
++	case 0x06:
++		usbcon_ep0_send(usbcon_qual_desc, sizeof(usbcon_qual_desc), len);
++		return;
++	case 0x03:
++		if (dnum == 0) {
++			usbcon_ep0_send(usbcon_str_lang, sizeof(usbcon_str_lang), len);
++		} else if (dnum == 1) {
++			usbcon_ep0_send(usbcon_str_mfr, usbcon_str_mfr_len, len);
++		} else if (dnum == 2) {
++			usbcon_ep0_send(usbcon_str_prod, usbcon_str_prod_len, len);
++		} else if (dnum == 3) {
++			usbcon_ep0_send(usbcon_str_ser, usbcon_str_ser_len, len);
++		} else {
++			usbcon_ep0_stall();
++		}
++		return;
++	default:
++		usbcon_ep0_stall();
++		return;
++	}
++}
++
++static void
++usbcon_bus_reset(void)
++{
++	usbcon_wr(USBCON_ENDPTCOMPLETE, usbcon_rd(USBCON_ENDPTCOMPLETE));
++	usbcon_wr(USBCON_ENDPTSETUPSTAT, usbcon_rd(USBCON_ENDPTSETUPSTAT));
++	usbcon_wr(USBCON_ENDPTFLUSH, 0xffffffff);
++	usbcon_wait_clear(USBCON_ENDPTFLUSH, 0xffffffff, 100);
++	usbcon_wr(USBCON_ENDPTCTRL(2), 0);
++	usbcon_wr(USBCON_ENDPTCTRL(3), 0);
++	usbcon_configured = 0;
++	usbcon_config_value = 0;
++	usbcon_tx_busy = 0;
++	usbcon_ep0_state = USBCON_EP0_IDLE;
++}
++
++static void
++usbcon_complete(uint32_t cpl)
++{
++	if (cpl & USBCON_EPT_TX(0)) {
++		if (usbcon_ep0_state == USBCON_EP0_DATA_IN) {
++			usbcon_ep0_status_out();
++		} else if (usbcon_ep0_state == USBCON_EP0_STATUS_IN) {
++			usbcon_ep0_state = USBCON_EP0_IDLE;
++		}
++	}
++	if (cpl & USBCON_EPT_RX(0)) {
++		if (usbcon_ep0_state == USBCON_EP0_STATUS_OUT) {
++			usbcon_ep0_state = USBCON_EP0_IDLE;
++		} else if (usbcon_ep0_state == USBCON_EP0_DATA_OUT) {
++			usbcon_ep0_status_in();
++		}
++	}
++	if (cpl & USBCON_EPT_TX(3)) {
++		usbcon_tx_busy = 0;
++	}
++}
++
++static void
++usbcon_poll(void)
++{
++	uint32_t sts = usbcon_rd(USBCON_USBSTS);
++	uint32_t setup, cpl;
++
++	if (!sts) {
++		return;
++	}
++	usbcon_wr(USBCON_USBSTS, sts);
++
++	if (sts & USBCON_STS_URI) {
++		usbcon_bus_reset();
++	}
++	if (!(sts & (USBCON_STS_UI | USBCON_STS_UEI | USBCON_STS_PCI))) {
++		return;
++	}
++
++	setup = usbcon_rd(USBCON_ENDPTSETUPSTAT);
++	if (setup & USBCON_EPT_RX(0)) {
++		usbcon_handle_setup();
++	}
++
++	cpl = usbcon_rd(USBCON_ENDPTCOMPLETE);
++	if (cpl) {
++		usbcon_wr(USBCON_ENDPTCOMPLETE, cpl);
++		usbcon_complete(cpl);
++	}
++}
++
++static void
++usbcon_pump(void)
++{
++	uint32_t n;
++
++	usbcon_poll();
++	if (!usbcon_configured) {
++		return;
++	}
++	if (usbcon_tx_busy) {
++		/* Host may not be reading yet (tty closed). After a while,
++		 * reap the stuck transfer and retry the same chunk. */
++		if (usbcon_now_ms() - usbcon_tx_start_ms > 5000) {
++			uint32_t c;
++
++			usbcon_wr(USBCON_ENDPTFLUSH, USBCON_EPT_TX(3));
++			usbcon_wait_clear(USBCON_ENDPTFLUSH, USBCON_EPT_TX(3), 100);
++			c = usbcon_rd(USBCON_ENDPTCTRL(3));
++			if (c & USBCON_CTRL_TXS) {
++				usbcon_wr(USBCON_ENDPTCTRL(3), c);
++			}
++			c = usbcon_rd(USBCON_ENDPTCOMPLETE);
++			if (c & USBCON_EPT_TX(3)) {
++				usbcon_wr(USBCON_ENDPTCOMPLETE, USBCON_EPT_TX(3));
++			}
++			usbcon_qh_prime(3, 1, &usbcon_dma.td_ep3,
++			    usbcon_dma.tx_buf, usbcon_tx_len);
++			usbcon_tx_start_ms = usbcon_now_ms();
++		}
++		return;
++	}
++	n = 0;
++	while (usbcon_ring_r != usbcon_ring_w && n < sizeof(usbcon_dma.tx_buf)) {
++		usbcon_dma.tx_buf[n++] = usbcon_ring[usbcon_ring_r];
++		usbcon_ring_r = (usbcon_ring_r + 1) & (USBCON_RING_SIZE - 1);
++	}
++	if (!n) {
++		return;
++	}
++	usbcon_tx_len = n;
++	usbcon_dcache_sync(usbcon_dma.tx_buf, n);
++	usbcon_qh_prime(3, 1, &usbcon_dma.td_ep3, usbcon_dma.tx_buf, n);
++	usbcon_tx_busy = 1;
++	usbcon_tx_start_ms = usbcon_now_ms();
++}
++
++static void
++usbcon_ring_putc(uint8_t c)
++{
++	uint32_t next = (usbcon_ring_w + 1) & (USBCON_RING_SIZE - 1);
++
++	if (next == usbcon_ring_r) {            /* full: drop oldest */
++		usbcon_ring_r = (usbcon_ring_r + 1) & (USBCON_RING_SIZE - 1);
++	}
++	usbcon_ring[usbcon_ring_w] = c;
++	usbcon_ring_w = next;
++}
++
++static inline uint32_t
++usbcon_gcc_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(usbcon_gcc + off);
++}
++
++static inline void
++usbcon_gcc_wr(uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(usbcon_gcc + off) = val;
++}
++
++static void
++usbcon_clocks_init(void)
++{
++	uint32_t v, n;
++
++	/* usb_hs_system_src: 80 MHz = GPLL0 (800 MHz) / 10 */
++	v = usbcon_gcc_rd(0x14);
++	v &= ~((0x7u << 8) | 0x1fu);
++	v |= (1u << 8) | 19u;
++	usbcon_gcc_wr(0x14, v);
++	usbcon_gcc_wr(0x10, usbcon_gcc_rd(0x10) | 1u);
++	n = 100;
++	while ((usbcon_gcc_rd(0x10) & 1u) && n--) {
++		usbcon_delay_ms(1);
++	}
++
++	/* LK's hsusb_clock_init: enable, disable, reset the block, enable */
++	usbcon_gcc_wr(0x08, usbcon_gcc_rd(0x08) | 1u);
++	n = 100;
++	while ((usbcon_gcc_rd(0x08) & (1u << 31)) && n--) {
++		usbcon_delay_ms(1);
++	}
++	usbcon_gcc_wr(0x04, usbcon_gcc_rd(0x04) | 1u);
++	n = 100;
++	while ((usbcon_gcc_rd(0x04) & (1u << 31)) && n--) {
++		usbcon_delay_ms(1);
++	}
++	usbcon_delay_ms(20);
++	usbcon_gcc_wr(0x08, usbcon_gcc_rd(0x08) & ~1u);
++	usbcon_gcc_wr(0x04, usbcon_gcc_rd(0x04) & ~1u);
++	usbcon_delay_ms(20);
++	usbcon_gcc_wr(0x00, 1);
++	usbcon_delay_ms(20);
++	usbcon_gcc_wr(0x00, 0);
++	usbcon_delay_ms(20);
++	usbcon_gcc_wr(0x08, usbcon_gcc_rd(0x08) | 1u);
++	n = 100;
++	while ((usbcon_gcc_rd(0x08) & (1u << 31)) && n--) {
++		usbcon_delay_ms(1);
++	}
++	usbcon_gcc_wr(0x04, usbcon_gcc_rd(0x04) | 1u);
++	n = 100;
++	while ((usbcon_gcc_rd(0x04) & (1u << 31)) && n--) {
++		usbcon_delay_ms(1);
++	}
++	usbcon_delay_ms(20);
++}
++
++static void
++usbcon_init(void)
++{
++	usbcon_base = ml_io_map(USBCON_USB_PA, USBCON_MAP_SIZE);
++	usbcon_gcc = ml_io_map(USBCON_GCC_PA, USBCON_MAP_SIZE);
++	usbcon_dma_pa = ml_vtophys((vm_offset_t)&usbcon_dma);
++
++	usbcon_build_string(usbcon_str_mfr, &usbcon_str_mfr_len, "ios-sweet");
++	usbcon_build_string(usbcon_str_prod, &usbcon_str_prod_len,
++	    "vivo Y21L xnu");
++	usbcon_build_string(usbcon_str_ser, &usbcon_str_ser_len, "Y21L-0001");
++
++	usbcon_clocks_init();
++
++	bzero(&usbcon_dma, sizeof(usbcon_dma));
++
++	usbcon_wr(USBCON_USBCMD, USBCON_CMD_RESET);
++	usbcon_delay_ms(20);
++	usbcon_wait_clear(USBCON_USBCMD, 2, 100);
++
++	usbcon_wr(USBCON_PORTSC, 0x80000000);   /* PTS = ULPI */
++	usbcon_ulpi_write(USBCON_ULPI_MISC_A_SET,
++	    USBCON_ULPI_VBUSVLDEXTSEL | USBCON_ULPI_VBUSVLDEXT);
++	usbcon_wr(USBCON_GENCONFIG_2, usbcon_rd(USBCON_GENCONFIG_2) | (1u << 7));
++	usbcon_wr(USBCON_USBCMD, usbcon_rd(USBCON_USBCMD) | (1u << 25));
++
++	usbcon_wr(USBCON_SBUSCFG, 0);
++	usbcon_wr(USBCON_AHB_MODE, 0x08);
++
++	usbcon_wr(USBCON_ENDPOINTLISTADDR, (uint32_t)usbcon_dma_pa);
++	usbcon_wr(USBCON_USBMODE, 2);
++
++	usbcon_wr(USBCON_ENDPTFLUSH, 0xffffffff);
++	usbcon_wait_clear(USBCON_ENDPTFLUSH, 0xffffffff, 100);
++
++	usbcon_dma.qh[0].config =
++	    (64u << 16) | USBCON_CONFIG_ZLT | USBCON_CONFIG_IOS;
++	usbcon_dma.qh[1].config = (64u << 16) | USBCON_CONFIG_ZLT;
++
++	usbcon_wr(USBCON_USBSTS, 0xffffffff);
++	usbcon_wr(USBCON_USBINTR, 0);
++
++	/* Drop any dirty lines left in the cacheable alias so the
++	 * controller only ever sees these initial values. */
++	usbcon_dcache_sync(&usbcon_dma, sizeof(usbcon_dma));
++
++	usbcon_wr(USBCON_USBCMD, usbcon_rd(USBCON_USBCMD) | USBCON_CMD_RUN);
++}
++
++static int
++usbcon_tr0(void)
++{
++	return 1;
++}
++
++static void
++usbcon_td0(int c)
++{
++	usbcon_ring_putc((uint8_t)c);
++	usbcon_pump();
++}
++
++static int
++usbcon_rr0(void)
++{
++	return 0;
++}
++
++static int
++usbcon_rd0(void)
++{
++	return -1;
++}
++
++static struct pe_serial_functions usbcon_serial_functions = {
++	.uart_init = usbcon_init,
++	.uart_set_baud_rate = NULL,
++	.tr0 = usbcon_tr0,
++	.td0 = usbcon_td0,
++	.rr0 = usbcon_rr0,
++	.rd0 = usbcon_rd0
++};
++
++#endif /* __arm64__ */
++
++/*****************************************************************************/
++
+ #ifdef SHMCON
+ 
+ #define CPU_CACHELINE_SIZE      (1 << MMU_CLINE)
+@@ -383,7 +1151,9 @@ shmcon_init(void)
+ 	pa_panic_base = reg_prop[0];
+ 	panic_size = reg_prop[1];
+ 
+-	shmcon = (struct shmcon_header *)ml_map_high_window(pa_panic_base, panic_size);
++	/* Device mapping: the writer only barriers, and a reader with caches off
++	 * (stage0) must see the bytes in DRAM, so no cacheable alias. */
++	shmcon = (struct shmcon_header *)ml_io_map(pa_panic_base, panic_size);
+ 	header_size = sizeof(*shmcon) + (NUM_CHILDREN * sizeof(shmcon->child[0]));
+ 	va_buffer_base = ROUNDUP((uintptr_t)(shmcon) + header_size, CPU_CACHELINE_SIZE);
+ 	va_buffer_end  = (uintptr_t)shmcon + panic_size - (sizeof(*end));
+@@ -799,6 +1569,9 @@ serial_init(void)
+ #ifdef SHMCON
+ 	uint32_t        jconmode;
+ #endif
++#if defined(__arm64__)
++	uint32_t        usbconmode;
++#endif
+ #ifdef DOCKFIFO_UART
+ 	uint32_t        no_dockfifo_uart;
+ #endif
+@@ -821,6 +1594,15 @@ serial_init(void)
+ 		uart_initted = 1;
+ 		return 1;
+ 	}
++#if defined(__arm64__)
++	usbconmode = 0;
++	if (PE_parse_boot_argn("usbcon", &usbconmode, sizeof(usbconmode))) {
++		gPESF = &usbcon_serial_functions;
++		gPESF->uart_init();
++		uart_initted = 1;
++		return 1;
++	}
++#endif
+ #ifdef SHMCON
+ 	jconmode = 0;
+ 	if (PE_parse_boot_argn("jcon", &jconmode, sizeof jconmode)) {
 diff --git a/tools/lldbmacros/Makefile b/tools/lldbmacros/Makefile
 index aec946f..db127ca 100644
 --- a/tools/lldbmacros/Makefile

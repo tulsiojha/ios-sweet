@@ -86,6 +86,60 @@ static int magic_ok(const char *m)
 	return 1;
 }
 
+/* ---------------- previous xnu console (SHMCON) ---------------- */
+
+static u32 rd32(u64 a) { return *(volatile u32 *)a; }
+static u64 rd64(u64 a) { return *(volatile u64 *)a; }
+
+#define SHMCON_MAGIC	0x53484d43u	/* 'SHMC' */
+#define SHMCON_VERSION	2
+
+/*
+ * xnu's SHMCON console writes kprintf into the panic area at the top of
+ * DRAM (the ADT "pram" node). With the window mapped as device memory the
+ * bytes reach DRAM without cache maintenance, so a previous run's log can
+ * be printed here before it gets overwritten. Offsets are the arm64 layout
+ * of struct shmcon_header (sidx/midx are 64-byte aligned).
+ */
+static void dump_prev_shmcon(u64 pram_pa)
+{
+	u64 out_pa = rd64(pram_pa + 16);
+	u32 out_len = rd32(pram_pa + 28);
+	u32 head = rd32(pram_pa + 132);		/* midx[CBUF_OUT] */
+	u32 tail = rd32(pram_pa + 68);		/* sidx[CBUF_OUT] */
+	u32 n, i;
+
+	if (rd32(pram_pa) != SHMCON_MAGIC ||
+	    *(volatile unsigned char *)(pram_pa + 4) != SHMCON_VERSION) {
+		log_printf("prev: no shmcon log (magic=%x)\n", rd32(pram_pa));
+		return;
+	}
+	log_printf("prev: shmcon out=%lx len=%u head=%u tail=%u\n",
+		   out_pa, out_len, head, tail);
+	if (out_len < 1024 || out_len > 0x100000 || head >= out_len ||
+	    tail >= out_len || out_pa < 0x80000000ull || out_pa >= 0xc0000000ull)
+		return;
+	n = (head + out_len - tail) % out_len;
+	if (n > 8192) {
+		/* keep the most recent bytes */
+		tail = (head + out_len - 8192) % out_len;
+		n = 8192;
+	}
+	log_puts("prev> ");
+	for (i = 0; i < n; i++) {
+		char c = *(volatile char *)(out_pa + (u64)((tail + i) % out_len));
+		log_printf("%c", (c >= 0x20 && c <= 0x7e) || c == '\n' || c == '\t' ? c : '.');
+	}
+	if (n == 0 || *(volatile char *)(out_pa + (u64)((tail + n - 1) % out_len)) != '\n')
+		log_puts("\n");
+}
+
+/*
+ * The APCS watchdog's bite powers the PMIC down instead of resetting the
+ * SoC (tested 2026-11-06), so it is not armed here; a hung xnu leaves the
+ * phone off until the power key is held.
+ */
+
 const char *loader_boot(void)
 {
 	const struct payload *p = (const struct payload *)RD_BASE;
@@ -100,6 +154,8 @@ const char *loader_boot(void)
 	log_printf("loader: payload v%u nsegs=%u virt=%lx phys=%lx size=%lx\n",
 		   p->version, p->nsegs, p->virt_base, p->phys_base,
 		   p->mem_size);
+
+	dump_prev_shmcon(p->phys_base + p->mem_size);
 
 	blob_len = p->adt_off + p->adt_size;
 	for (i = 0; i < p->nsegs; i++) {
@@ -153,7 +209,7 @@ const char *loader_boot(void)
 
 	entry_pa = p->entry_va + pa_of_va_base;
 	log_printf("loader: jumping to %lx\n", entry_pa);
-	log_drain(400);
+	log_drain(1500);
 
 	/* MMU/caches off writes; drop stale I-cache lines like sweet's shim. */
 	__asm__ volatile("dsb sy; ic iallu; dsb sy; isb" ::: "memory");

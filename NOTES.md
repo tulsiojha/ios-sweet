@@ -268,6 +268,35 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   both flashes). Android boot is user-verified visually. Next: a console/side-effect
   probe for xnu (UART or the
   ChipIdea device-mode USB behind ml_irq/IOCPU), then GICv2 + FDT platform expert.
+- **xnu-4903 console: SHMCON dead end, device-mode USB planned and now built
+  (2026-11-06).** SHMCON: xnu-4903 built with `options SHMCON` (patch now carries it;
+  pe_serial.c shmcon_init maps the ADT `pram` node with ml_io_map, i.e. device memory,
+  because the writer only barriers). It writes nothing visible without a reader, so
+  the plan was: run with `jcon=1`, let it hang, reset the SoC, then have stage0 dump
+  the DRAM ring on the next boot (loader.c dump_prev_shmcon). TEST: image
+  `out/vivo-boot-shmcon.img` (sha256 e7c356b9...d744, loader armed the APCS WDT at
+  0x0b017000 with bark 196608 / bite 327680 = 6 s/10 s at 32 kHz). RESULT: the stage0
+  USB console never enumerated (no tty.usbmodem across four 38 s cycles) and the
+  phone ended BLACK/POWERED OFF - the WDT bite powers the PMIC down instead of
+  resetting the SoC, so there is no reset to exploit. OBSERVATION: do not arm the WDT
+  again. Stock boot.img restored again (fastboot, 51042586...35b1). loader.c's
+  wdt_arm_reset() is removed; dump_prev_shmcon() stays (it only reads and costs
+  nothing, useful if DRAM ever survives a warm reset). DECISION: live console must
+  come from xnu itself -> pexpert/arm/pe_serial.c now has a `usbcon` backend: polled
+  ChipIdea device controller (same USB_BASE 0x078d9000, ULPI/clock bring-up,
+  EP0 enumeration and CDC-ACM descriptors as stage0), bulk IN console on EP3, boot-arg
+  `usbcon=1` in the kernel cmdline (mkpayload.sh + CI smoke test now pass it). DMA
+  memory is one 16 KB-aligned static block (`_usbcon_dma` at 0xfffffff0078ae000,
+  inside __DATA; the loader maps the whole image with pa = va + const so the image is
+  physically contiguous), QH/TD/buffers addressed by ml_vtophys, and the code does
+  its own `dc civac` by VA before every prime because the T7000 machine config
+  defines __ARM_COHERENT_IO__ (Apple coherent fabric) and compiles the arm64 cache
+  helpers to no-ops - wrong for msm8916 but harmless to bypass. Ring 32 KB, drops
+  oldest; a stuck EP3 transfer is flushed and re-primed after 5 s (tty not open yet).
+  LOCAL BUILD: kernel.development.t7000 10,210,024 B, links clean; boot image
+  `ports/vivo-y21l/out/vivo-boot-usbcon.img` 29,154,538 B, sha256
+  6612ac38...156d (payload 10,216,896 B, kernel_end 0xfffffff007a64000, ADT at the
+  same place as before). NOT yet flashed.
   CI: `.github/workflows/xnu-4903.yml` (commit 8eedd8f) applies the patch to a fresh
   494ffe1 clone and builds on `macos-15-intel`. `macos-14` now resolves to
   `macos-14-arm64-us-default`, a configuration this repo cannot use ("The configuration
@@ -291,11 +320,11 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) get the xnu-4903 CI run green on the lldbmacros fix and compare
-  its kernel artifact with the local build; (2) mkpayload.py LC_DYLD_INFO rebase support
-  is done (commit 839585a); the current build has no rebases at all, so plug the kernel
-  Mach-O into mkpayload.sh / the v15 flash recipe and boot-test (temporary `fastboot
-  flash boot`, confirm with user);
+- **Next steps:** (1) flash-test the usbcon image (`fastboot flash boot
+  out/vivo-boot-usbcon.img`, needs the user in fastboot, temporary flash with stock
+  restore): expect the stage0 log, then the CDC-ACM tty to drop and re-enumerate
+  (bus reset), then xnu's "kprintf initialized"/"Serial mode specified" text on
+  `cat /dev/tty.usbmodem*`; (2) compare the CI artifact with the local kernel;
   (3) implement GICv2 + arch timer (PPI 19) behind ml_irq/IOCPU plus an FDT platform
   expert for our ADT (AIC will not be used); (4) take
   ADT shapes from a real D10AP/iOS 12 device tree (Apple artifact, keep out of git);

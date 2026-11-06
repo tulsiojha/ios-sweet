@@ -63,7 +63,7 @@ jobs:
         run: |
           python3 ports/vivo-y21l/mkadt.py out/vivo.adt
           python3 tools/mkpayload.py out/kernel.development.t7000 out/vivo.adt out/payload.bin \
-            --cmdline "debug=0x8 serial=3 keepsyms=1"
+            --cmdline "debug=0x8 serial=3 keepsyms=1 usbcon=1"
 
       - uses: actions/upload-artifact@v4
         if: always()

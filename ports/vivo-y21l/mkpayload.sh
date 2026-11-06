@@ -26,7 +26,7 @@ fi
 
 python3 mkadt.py out/vivo.adt
 python3 "$ROOT/tools/mkpayload.py" "$kernel" out/vivo.adt out/payload.bin \
-	--cmdline "debug=0x8 serial=3 keepsyms=1"
+	--cmdline "debug=0x8 serial=3 keepsyms=1 usbcon=1"
 python3 "$ROOT/tools/vivo-repack-boot.py" \
 	"$ROOT/device-info/vivo-stock/boot.img" \
 	"$ROOT/ports/vivo-y21l/stage0/out/stage0v5.bin" \
