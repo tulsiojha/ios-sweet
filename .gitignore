@@ -2,6 +2,12 @@
 backup/
 dtb/
 recovery/
+# vivo Y21L port: live DTB + adb dumps
+vivo.dtb
+device-info/
+# vivo Y21L stock firmware (1.3 GB user-downloaded package)
+PD1309F*.zip
+ports/vivo-y21l/stage0/out/
 # third-party/Apple sources fetched for reading
 research/
 shim/out/

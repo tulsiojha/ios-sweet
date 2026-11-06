@@ -1,5 +1,46 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## NEW PORT (2026-11-06): iOS 12 on vivo Y21L (MSM8916) - read first
+
+Second target, separate from sweet. Phone serial c25ac45b; DTB copied to `vivo.dtb`
+(repo root, gitignored). Full adb dump in `device-info/vivo-y21l-profile.md` (gitignored).
+
+- **Hardware:** vivo Y21L (PD1309F), MSM8916, 4x Cortex-A53, ~920 MiB RAM, 16 GB eMMC
+  (SDHCI @0x7824900), 480x854 command-mode DSI NT35510S panel, Synaptics RMI4 S3202 touch
+  (i2c-5 0x20), PM8916 SPMI, SMB358 charger, **ChipIdea HSUSB** @0x78d9000, WCNSS, Adreno 306.
+  Android 5.1.1 user build, no root, 32-bit userland; kernel 3.10.49.
+- **Bootloader is UNLOCKED and custom code PROVEN (2026-11-06, stage0 v3).** Fastboot
+  (`fastboot flash boot` / `erase` work; `boot` / `fetch` / `oem` are unimplemented but not
+  needed). LK = `emmc_appsboot.mbn` from the OTA, 32-bit ARM ELF, entry 0x8f600000; it has
+  NO zImage-magic check (no 0x016f2818 literal) and does not verify boot images when
+  unlocked: a stock boot.img with only the cmdline edited (+` vivo_cmdline_test=1`) boots
+  Android normally. LK loads the kernel to the header's kernel_addr (0x80008000) and jumps.
+- **Stage0 v3 beacon works:** a 24-byte stub that writes 0 to qcom,pshold (0x4ab000) as its
+  FIRST action makes the phone power off ~1 s after the vivo logo; with USB attached the
+  PMIC re-boots on VBUS so it looks like a logo boot loop (that IS the success signal).
+  v1/v2 (UART write first, TXRDY poll at 0x78b0000) hung at the logo - do NOT touch BLSP1
+  UART before enabling its clocks. Image `device-info/vivo-stock/vivo-test3-boot.img`
+  (sha256 48aea799...607e). LK jumps in AArch32 at EL2 (msm8916 boots Linux into HYP mode).
+- **Test loop (all verified):** `fastboot flash boot <img>` (stock boot.img sha256
+  51042586...35b1 restores Android, boots in ~15 s) -> `fastboot reboot` ->
+  `adb reboot bootloader` returns to fastboot. Repacks via `tools/vivo-repack-boot.py`
+  (replaces kernel area only; ramdisk/QCDT/trailing PKCS#7 untouched).
+- **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
+  iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
+  xnu-8796 + iOS 12 userland vs port xnu-4903).
+- **Port deltas vs sweet:** 32-bit stage0 (real one) must switch AArch32 EL2 -> AArch64
+  (lk2nd-style HCR.RW + eret) and then jump to the AArch64 payload; SDHCI eMMC driver,
+  GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
+  (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
+  USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
+- **Next steps:** (1) restore stock boot.img (user in fastboot); (2) write stage0 v4 =
+  real diagnostic: enable UART clocks (GCC) or skip UART, print to screen by taking over
+  the DSI command-mode link is HARD - better: enable UART2 clocks via GCC and log at
+  115200; (3) EL2->AArch64 switch + tiny AArch64 payload that writes pshold (proves EL1);
+  (4) sweet-style payload pipeline (mkpayload) for this device; (5) SDHCI + GICv2 + ADT.
+- This Mac session has no cross gcc + no gh CLI; kernel builds still go through the public
+  repo's GitHub Actions (`dipa-studio/ios-sweet`).
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
