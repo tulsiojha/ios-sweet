@@ -12,6 +12,9 @@ concurrency:
   group: xnu-4903-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   XNU_REPO: https://github.com/apple-oss-distributions/xnu
   XNU_TAG: xnu-4903.270.47
