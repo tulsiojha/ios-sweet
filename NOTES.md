@@ -109,17 +109,21 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   LBA1, entry array (128x128 B = 32 blocks) read with CMD23 + multi-block CMD18 through a
   chunked ADMA2 table, listing name/first LBA/block count per used partition. Replay gains
   `fast=%x` (1 = 8-bit, 4 = 25 MHz). Image `device-info/vivo-stock/vivo-test7-boot.img`
-  sha256 c3fd6b54...0965b. **Flashed 2026-11-06: the payload enumerated (USB serial
-  appears, ioreg "vivo Y21L stage0", same instance id throughout, no re-enumeration) but
-  the CPU hung inside the probe before the host could read any log; opening the tty then
-  blocks in control transfers. Cause not yet located (a v6-style run with only CMD8/CMD6/
-  clock/CMD18 added hangs; the fault handler exists but nothing reached the wire).** v7b
-  (image `vivo-test7b-boot.img` sha256 9bb431e1...49ec) is pure instrumentation: probe now
-  starts 20 s after attach, `probe_drain()` (30 ms of usb_poll/usb_pump) after every probe
-  log line and before risky steps, extra `emmc: sw idx=val`, `emmc: ext_csd read`,
-  `emmc: raise clk`, `emmc: multi N blk @ lba` markers; GPT scan runs only if the post-switch
-  verify read passed. Next: power-cycle into fastboot, flash v7b, pre-arm a tty reader so the
-  log is caught live, and read the last line before the hang.
+  sha256 c3fd6b54...0965b. **Flashed 2026-11-06 (v7, then v7b): the payload is fine - the
+  earlier "CPU hung" reading was a host-side tty problem: on this macOS a plain `cat` or any
+  open without O_NONBLOCK blocks on the CDC tty, while the payload kept heartbeating
+  (ioreg instance id unchanged, USB attached). Use `tools/vivo-console-read.py` (raw,
+  nonblocking). v7b replay after a complete run: `emmc=ok fast=4`, i.e. the probe finished,
+  high speed + 25 MHz engaged, 8-bit did not (bit0 clear - CMD6 183=2 failed or EXT_CSD
+  lacks it). One `usb: tx3 stalled, retrying` was seen while no host was reading. The
+  detailed probe lines were lost from the ring (queued into a stalled bulk-IN TD before the
+  host opened the port), so one more boot with the reader armed from t=0 is needed to capture
+  the CID/CMD6/`gpt:` lines.** v7b (image `vivo-test7b-boot.img` sha256 9bb431e1...49ec)
+  adds: probe starts 20 s after attach, `probe_drain()` (30 ms of usb_poll/usb_pump) after
+  every probe log line and before risky steps, extra `emmc: sw idx=val`, `emmc: ext_csd
+  read`, `emmc: raise clk`, `emmc: multi N blk @ lba` markers; GPT scan runs only if the
+  post-switch verify read passed. Next: power-cycle (boot partition already holds v7b), arm
+  the console reader before boot, capture the full probe log; then fastboot + restore stock.
 - **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
   iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
   xnu-8796 + iOS 12 userland vs port xnu-4903).
@@ -128,8 +132,10 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) flash stage0 v7 and check the EXT_CSD decode, the 8-bit/HS switch,
-  the fast verify and the GPT partition list (fix whatever fails); (2) GICv2 + arch timer +
+- **Next steps:** (1) capture the full v7b probe log (boot partition already holds v7b;
+  arm `tools/vivo-console-read.py` before power-on), check the EXT_CSD decode, the 8-bit
+  switch (fast=4 means only HS+25 MHz took), the verify read and the GPT list; then restore
+  the stock boot.img; (2) GICv2 + arch timer +
   exception handling when IRQs are needed (until then IRQs stay masked and the GIC off);
   (3) sweet-style payload pipeline (mkpayload) for this device; (4) msm8916 ADT generator;
   (5) iOS 12 root image into userdata (destructive, confirm first).
