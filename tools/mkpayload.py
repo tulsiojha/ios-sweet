@@ -3,10 +3,14 @@
 
   mkpayload.py KERNEL ADT OUT [--cmdline "..."] [--ramdisk IMAGE]
 
-The kernel is linked as a PIE with LC_DYLD_CHAINED_FIXUPS. Nobody else
-(no kmutil, no iBoot) resolves those for us, and xnu only rebases static
-kernelcaches itself, so the chains are walked here and every pointer is
-rewritten to its unslid target. The shim then only copies flat segments.
+The kernel is a PIE. Chained fixups (LC_DYLD_CHAINED_FIXUPS, iOS 16-class
+kernels such as sweet's) store encoded pointers; nobody else (no kmutil, no
+iBoot) resolves those for us, and xnu only rebases static kernelcaches
+itself, so the chains are walked here and every pointer is rewritten to its
+unslid target. Classic LC_DYLD_INFO_ONLY rebases (iOS 12-class kernels) only
+mark locations whose linked values are already the unslid VAs, which is what
+runs here, so that stream is validated and counted, not rewritten. The shim
+then only copies flat segments.
 
 Payload layout (little endian, all offsets from payload start):
   0x000  char  magic[8] = "SWEETXNU"
@@ -32,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
 
 LC_SEGMENT_64, LC_UNIXTHREAD, LC_DYLD_CHAINED_FIXUPS = 0x19, 0x5, 0x80000034
+LC_DYLD_INFO, LC_DYLD_INFO_ONLY = 0x22, 0x80000022
 PAGE = 0x4000
 BOOT_LINE_LENGTH = 608
 CMDLINE = 0x48
@@ -41,7 +46,7 @@ SEG_TABLE = CMDLINE + BOOT_LINE_LENGTH	# 0x2a8
 def parse_macho(buf):
     magic, cputype, cpusub, ftype, ncmds, sizeofcmds, flags, _ = struct.unpack_from('<8I', buf, 0)
     assert magic == 0xfeedfacf, 'not a 64-bit Mach-O'
-    segs, entry, fixups = [], None, None
+    segs, entry, fixups, dyld_info = [], None, None, None
     off = 32
     for _ in range(ncmds):
         cmd, size = struct.unpack_from('<II', buf, off)
@@ -55,8 +60,78 @@ def parse_macho(buf):
             entry, = struct.unpack_from('<Q', buf, off + 16 + 32 * 8)
         elif cmd == LC_DYLD_CHAINED_FIXUPS:
             fixups = struct.unpack_from('<II', buf, off + 8)	# dataoff, datasize
+        elif cmd in (LC_DYLD_INFO, LC_DYLD_INFO_ONLY):
+            # rebase_off, rebase_size, bind_off, bind_size, weak, lazy, export
+            dyld_info = struct.unpack_from('<8I', buf, off + 8)[:4]
         off += size
-    return dict(cputype=cputype, cpusub=cpusub & 0xff, segs=segs, entry=entry, fixups=fixups)
+    return dict(cputype=cputype, cpusub=cpusub & 0xff, segs=segs, entry=entry, fixups=fixups,
+                dyld_info=dyld_info)
+
+
+def count_dyld_rebases(buf, m):
+    """Walk classic rebase opcodes (iOS 12-era kernels, LC_DYLD_INFO_ONLY).
+
+    The stream's pointers already hold their link-time VAs; the kernel runs
+    unslid here, so nothing is rewritten - the walk exists to prove the
+    stream is understood and to report the count.
+    """
+    rebase_off, rebase_size, bind_off, bind_size = m['dyld_info']
+    assert bind_size == 0, 'kernel has binds; only rebases are supported'
+    o, end = rebase_off, rebase_off + rebase_size
+    seg = 0
+    addr = 0
+    n = 0
+
+    def uleb():
+        nonlocal o
+        v = shift = 0
+        while True:
+            b = buf[o]
+            o += 1
+            v |= (b & 0x7f) << shift
+            shift += 7
+            if not b & 0x80:
+                return v
+
+    def one():
+        nonlocal n
+        loc = m['segs'][seg]['fileoff'] + addr
+        assert 0 <= loc <= len(buf) - 8, 'rebase outside the file'
+        n += 1
+
+    while o < end:
+        b = buf[o]
+        o += 1
+        op, imm = b & 0xf0, b & 0x0f
+        if op == 0x00:			# REBASE_OPCODE_DONE
+            break
+        elif op == 0x10:		# SET_TYPE_IMM
+            assert imm == 1, f'rebase type {imm} is not a pointer'
+        elif op == 0x20:		# SET_SEGMENT_AND_OFFSET_ULEB
+            seg, addr = imm, uleb()
+        elif op == 0x30:		# ADD_ADDR_ULEB
+            addr += uleb()
+        elif op == 0x40:		# ADD_ADDR_IMM_SCALED
+            addr += imm * 8
+        elif op == 0x50:		# DO_REBASE_IMM_TIMES
+            for _ in range(imm):
+                one()
+                addr += 8
+        elif op == 0x60:		# DO_REBASE_ULEB_TIMES
+            for _ in range(uleb()):
+                one()
+                addr += 8
+        elif op == 0x70:		# DO_REBASE_ADD_ADDR_ULEB
+            one()
+            addr += 8 + uleb()
+        elif op == 0x80:		# DO_REBASE_ULEB_TIMES_SKIPPING_ULEB
+            times, skip = uleb(), uleb()
+            for _ in range(times):
+                one()
+                addr += 8 + skip
+        else:
+            raise ValueError(f'bad rebase opcode 0x{b:02x}')
+    return n
 
 
 def apply_chained_fixups(buf, m):
@@ -143,7 +218,12 @@ def adt_dram(adt_blob):
 def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
-    nfix = apply_chained_fixups(buf, m)
+    if m['fixups']:
+        nfix = apply_chained_fixups(buf, m)
+    elif m['dyld_info']:
+        nfix = count_dyld_rebases(buf, m)
+    else:
+        nfix = 0
     # MH_EXECUTE test kernels carry a __PAGEZERO guard; a real kernel does not.
     segs = [s for s in m['segs'] if s['vmsize'] and s['name'] != '__PAGEZERO']
     text = segs[0]

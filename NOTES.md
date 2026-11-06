@@ -185,23 +185,42 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   first v15 flash wrote 0x580 bytes early and the loader refused to jump (safe).
   Images: v15 bad 74f45937...987b, v15 good 50ca5023...a427; commits a118bb9 (pipeline),
   0b026f8 (page-align fix). mkpayload.py now skips __PAGEZERO (test kernels only).
-- **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
-  iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
-  xnu-8796 + iOS 12 userland vs port xnu-4903). Note for that choice: msm8916 is GICv2
-  with Qualcomm's remapped timer PPIs, so an iOS 16-class kernel needs GICv2 support
-  added; xnu-4903 (iOS 12) still carries the A8 GICv2 driver. The ADT GIC node shape and
-  the virtual-timer INTID should be taken from a real A8/iOS 12 device tree, not guessed.
+- **DECISION 2026-11-06: port xnu-4903 (iOS 12; userland iPhone7,2 / D10AP 12.5.7).**
+  CORRECTION to the earlier note: xnu-4903 does NOT carry an A8 GICv2 driver. A7-A11 use
+  Apple's AIC; the 4903 tree has no GIC/GICC code anywhere. `sleh_irq()` dispatches only
+  through `cdp->interrupt_handler` (installed by IOCPU via ml_install_interrupt_handler)
+  and the Apple timer is FIQ-based (`fleh_fiq_*` per machine, tbd_ops in
+  pe_identify_machine.c). GICv2 for msm8916 is new platform code behind those interfaces
+  either way. Also, os/log.c needs Apple-internal `<os/firehose_buffer_private.h>`; the
+  OSS drop ships neither the header nor the reserve/flush implementation.
+- **xnu-4903 local build state (2026-11-06):** apple-oss-distributions/xnu tag
+  xnu-4903.270.47 (commit 494ffe1) at /tmp/xnu-4903. Invocation:
+  `make ARCH_CONFIGS=ARM64 KERNEL_CONFIGS=DEVELOPMENT MACHINE_CONFIGS=T7000 SDKROOT=macosx
+  ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64
+  INCFLAGS_SDK=-I/tmp/xnu-4903/stage/usr/local/include/kernel BUILD_WERROR=0`.
+  Modern-toolchain fixes found so far (local, uncommitted): python3 shebang in
+  bsd/kern/makekdebugevents.py; create BUILD/obj/EXPORT_HDRS/libsa and
+  stage/usr/local/include/kernel (empty, satisfy -Wmissing-include-dirs); add
+  `options MONOTONIC` to config/MASTER.arm64 (machine/monotonic.h uses MT_CORE_NFIXED
+  unguarded); replace the assym.s sed with makedefs/genassym_extract.py (modern clang
+  folds single-char `.ascii "4"` into `.byte 52`, which the sed cannot parse and which
+  also duplicated the label); vendor libkern/os/firehose_buffer_private.h (kernel subset
+  of libdispatch-913.60.2) + libkern/os/firehose_buffer_stub.c (reserve returns NULL,
+  flush no-op; os_log falls back to firehose_boot_chunk).
 - **Port deltas vs sweet:** 32-bit stage0 (real one) must switch AArch32 EL2 -> AArch64
   (lk2nd-style HCR.RW + eret) and then jump to the AArch64 payload; SDHCI eMMC driver,
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) restore the stock boot.img (needs fastboot); later consider 50 MHz
-  (GPLL0/8 + divider 1); (2) decide the kernel baseline (xnu-4903 for the GICv2 A8 path
-  vs adding GICv2 to xnu-8796), then plug a real kernel Mach-O into mkpayload.sh - the
-  loader already takes any SWEETXNU blob; (3) settle the GICv2 ADT node from a real
-  A8/iOS 12 device tree; (4) iOS 12 root image into userdata (destructive, confirm
-  first); GICv2 + 1 kHz arch timer done (v14, PPI 19); payload pipeline done (v15).
+- **Next steps:** (1) finish the xnu-4903 modern-toolchain patch set until mach_kernel
+  links, then add a repo CI workflow for it (the pinned blacktop build path cannot build
+  10.14-era xnu); (2) make mkpayload.py resolve LC_DYLD_INFO rebase opcodes - iOS 12
+  kernels predate chained fixups, so the loader path needs that variant - then plug the
+  kernel Mach-O into mkpayload.sh; (3) implement GICv2 + arch timer (PPI 19) behind
+  ml_irq/IOCPU plus an FDT platform expert for our ADT (AIC will not be used); (4) take
+  ADT shapes from a real D10AP/iOS 12 device tree (Apple artifact, keep out of git);
+  (5) iOS 12 root image into userdata (destructive, confirm first). v15 stock restore
+  done 2026-11-06; later optionally 50 MHz SDCC1 (GPLL0/8 + divider 1).
   BLSP1 UART2 stays a fallback (GCC clocks needed, pins probably not exposed). Reference
   for the SCM path: lk2nd `platform/msm_shared/scm.c` + `app/aboot/aboot.c` (cloned at
   /tmp/lk2nd, not in git).
