@@ -324,6 +324,54 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   New image `ports/vivo-y21l/out/vivo-boot-msmport.img` 29,154,538 B, sha256
   fa804e87...0ff1 (kernel size unchanged at 10,210,024 B because segment sizes are
   page-rounded). Ready to flash.
+- **xnu-4903 BOOT TEST v18 (2026-11-06): msmport image flashed; STILL no xnu USB -
+  xnu dies before serial_init, now with no Apple SPR left.** Image
+  out/vivo-boot-msmport.img (fa804e87...0ff1) flashed OKAY and rebooted; stage0
+  log (/tmp/usbcon-stage0-2.log) runs the usual probe and ends at `loader: jumping
+  to 00000000890f90a0`. OBSERVATION: macOS still reports the device as "vivo Y21L
+  stage0" (1209:0001) at kUSBAddress 1 and the tty reads 0 bytes - no controller
+  reset, so usbcon_init() never ran. Dead ends AUDITED from source (all consistent,
+  no change made): (a) boot_args virtBase/physBase are coherent - start.s
+  552-565 shifts x22/x23 by (mach PA - physBase) = 0x1004000 so the kernel runs at
+  its link VAs with slide 0, so the mkpayload 32 MB-aligned virtBase is correct;
+  (b) early_random needs exactly 64 seed bytes (ENTROPY_BUFFER_BYTE_SIZE) and
+  mkadt.py already emits a 64-byte /chosen random-seed, so it is not the hang;
+  (c) PE_init_platform, pe_identify_machine (early-return, no Apple soc node),
+  ml_parse_cpu_topology, cpu_bootstrap/cpu_init, rtclock_early_init and
+  PE_consistent_debug_inherit were read and contain nothing A53-fatal. The failure
+  point is still unknown, so v19 adds an EARLY CONSOLE that starts at the top of
+  arm_init.
+- **EARLY CONSOLE built, NOT yet flashed (v19, 2026-11-06).** Design: before
+  pmap_bootstrap there is no ml_io_map (it would map at VA 0), so the console uses
+  identity (V=P) aliases added to start.s's bootstrap TTBR0 tables: with
+  MSM8916_PORT, start.s takes a 5th page from the free-pointer pool (x2; 8 pages
+  exist, 4 used by the two create_bootstrap_mapping calls) and installs one L1
+  entry (index 0) + one L2 page with Device-nGnRnE 2 MB blocks for GCC
+  0x01800000, USB 0x07800000 and QGIC 0x0b000000 (MAIR attr3 = 0x00, entry
+  0x40D = BLOCK|VALID|ATTRINDX(3)<<2|AF). pe_serial.c gains
+  usbcon_early_start(physBase, virtBase) / usbcon_early_puts / usbcon_rebind:
+  the same ChipIdea bring-up as usbcon_init but with the base addresses used
+  directly (`usbcon_base = USBCON_USB_PA`) and DMA addressed block-relative
+  (`usbcon_dma_addr(p) = usbcon_dma_pa + (p - &usbcon_dma)`), because ml_vtophys
+  is invalid before arm_vm_init (gVirtBase unset). arm_init calls it right after
+  cpu_data_init and BEFORE PE_init_platform (boot args aren't parseable yet:
+  PE_boot_args() dereferences PE_state.bootArgs, set only by PE_init_platform),
+  then probes: "xnu> arm_init", pe_init_platform, cpu_topology, cpu_bootstrap,
+  rtclock_early, kernel_early_bootstrap, cpu_init, processor_bootstrap,
+  "xnu> arm_vm_init", and inside arm_vm_init: entry, early_random, before
+  `set_mmu_ttb(invalid_ttep)` ("avm ttbr0 off"), after pmap_bootstrap
+  (usbcon_rebind + "avm pmap up") and "avm done". Each puts() pumps the device
+  for up to 500 ms. The later boot-arg usbcon=1 path (serial_init) is unchanged.
+  serial_init's uart_initted reinit path is avoided by not setting it early.
+  DEBUGGING AID: if the v19 tty stays empty the early console itself is broken
+  (mapping or USB init), not xnu's destination; stage0's device still being
+  enumerated tells us nothing new. LOCAL BUILD: kernel 10,210,160 B,
+  image `ports/vivo-y21l/out/vivo-boot-earlycon.img` 29,154,538 B, sha256
+  067d0ecb...9fe1 (payload 10,217,024 B, virt_base 0xfffffff006000000, entry
+  0xfffffff0070f90a0, kernel_end 0xfffffff007a64000, ADT 5920 B, cmdline
+  `debug=0x8 serial=3 keepsyms=1 usbcon=1`). Patch regenerated:
+  ports/vivo-y21l/xnu-4903-arm64-oss-build.patch 1551 lines / 17 files,
+  verified applying clean to a fresh 494ffe1 clone (git apply --check).
   CI: `.github/workflows/xnu-4903.yml` (commit 8eedd8f) applies the patch to a fresh
   494ffe1 clone and builds on `macos-15-intel`. `macos-14` now resolves to
   `macos-14-arm64-us-default`, a configuration this repo cannot use ("The configuration
@@ -347,13 +395,14 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) flash-test the usbcon image (`fastboot flash boot
-  out/vivo-boot-usbcon.img`, needs the user in fastboot, temporary flash with stock
-  restore): expect the stage0 log, then the CDC-ACM tty to drop and re-enumerate
-  (bus reset), then xnu's "kprintf initialized"/"Serial mode specified" text on
-  `cat /dev/tty.usbmodem*`; (2) compare the CI artifact with the local kernel;
-  (3) implement GICv2 + arch timer (PPI 19) behind ml_irq/IOCPU plus an FDT platform
-  expert for our ADT (AIC will not be used); (4) take
+- **Next steps:** (1) flash-test the early-console image (`fastboot flash boot
+  out/vivo-boot-earlycon.img`, needs the user in fastboot; phone currently runs
+  the hung msmport image) and read `tools/vivo-console-read.py` (raw, nonblocking;
+  plain cat blocks on this macOS CDC tty) while the phone boots: the "xnu>"
+  probes say where execution stops, or an empty tty says the early console
+  itself needs debugging; (2) compare the CI artifact with the local kernel;
+  (3) implement GICv2 + arch timer (PPI 19) behind ml_irq/IOCPU plus an FDT
+  platform expert for our ADT (AIC will not be used); (4) take
   ADT shapes from a real D10AP/iOS 12 device tree (Apple artifact, keep out of git);
   (5) iOS 12 root image into userdata (destructive, confirm first). v15 stock restore
   done 2026-11-06; later optionally 50 MHz SDCC1 (GPLL0/8 + divider 1).
