@@ -494,7 +494,7 @@ index 6a8d109..422d367 100644
  
  	.text
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index f709217..c1e6aff 100644
+index f709217..7f6e1b2 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -33,6 +33,16 @@
@@ -536,7 +536,7 @@ index f709217..c1e6aff 100644
  	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
  	mov		x20, x0
  	mov		x21, #0
-@@ -600,6 +616,29 @@ Linvalidate_bootstrap:							// do {
+@@ -600,6 +616,32 @@ Linvalidate_bootstrap:							// do {
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
@@ -561,12 +561,34 @@ index f709217..c1e6aff 100644
 +	mov		x9, #0x0b000000					// QGIC
 +	orr		x9, x13, x9
 +	str		x9, [x2, #0x2c0]				// L2 index 88
++	mov		x9, #0x00400000					// PS_HOLD (bring-up beacon)
++	orr		x9, x13, x9
++	str		x9, [x2, #0x10]					// L2 index 2
 +#endif /* MSM8916_PORT */
 +
  	/* Ensure TTEs are visible */
  	dsb		ish
  
-@@ -747,7 +786,7 @@ common_start:
+@@ -743,11 +785,26 @@ common_start:
+ 	msr		CPACR_EL1, x0
+ #endif
+ 
++#if defined(MSM8916_PORT)
++	/* The block above is compiled out for KERNEL_INTEGRITY_WT boards
++	 * because a Watchtower monitor configures CPACR_EL1 there.  msm8916
++	 * has no such monitor, so FP/SIMD stays trapped (FPEN = 0, the ARM
++	 * reset value) and the first NEON instruction the compiler emits -
++	 * a struct copy, a bzero, the early console building its descriptor
++	 * strings - takes an exception before any vector or console exists,
++	 * which reads as a silent hang at the kernel entry point.  Linux on
++	 * the same firmware does this in head.S for the same reason.
++	 */
++	mov		x0, #(CPACR_FPEN_ENABLE)
++	msr		CPACR_EL1, x0
++	isb		sy
++#endif
++
+ 	// Clear thread pointer
  	mov		x0, #0
  	msr		TPIDR_EL1, x0						// Set thread register
  
@@ -575,7 +597,7 @@ index f709217..c1e6aff 100644
  	// Initialization common to all Apple targets
  	ARM64_IS_PCORE x15
  	ARM64_READ_EP_SPR x15, x12, ARM64_REG_EHID4, ARM64_REG_HID4
-@@ -756,7 +795,7 @@ common_start:
+@@ -756,7 +813,7 @@ common_start:
  	ARM64_WRITE_EP_SPR x15, x12, ARM64_REG_EHID4, ARM64_REG_HID4
  #endif  // APPLE_ARM64_ARCH_FAMILY
  
@@ -598,10 +620,10 @@ index d296cb6..d9d5953 100644
  ${SOBJS}: assym.s
  
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index 3e70e3f..96b1e6a 100644
+index 3e70e3f..a36d1fb 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -220,6 +220,844 @@ static struct pe_serial_functions dcc_serial_functions = {
+@@ -220,6 +220,855 @@ static struct pe_serial_functions dcc_serial_functions = {
  
  /*****************************************************************************/
  
@@ -1253,6 +1275,17 @@ index 3e70e3f..96b1e6a 100644
 +{
 +	uint32_t v, n;
 +
++	/* A bootloader (stage0 on this port) leaves these clocks running at
++	 * 80 MHz with the controller live. Re-running the branch-disable and
++	 * block-reset sequence on that state is not what LK's cold-boot path
++	 * does and can stall the USB AHB port, so keep the configuration when
++	 * it already matches. */
++	v = usbcon_gcc_rd(0x14);
++	if ((v & ((0x7u << 8) | 0x1fu)) == ((1u << 8) | 19u) &&
++	    (usbcon_gcc_rd(0x08) & 1u) && (usbcon_gcc_rd(0x04) & 1u)) {
++		return;
++	}
++
 +	/* usb_hs_system_src: 80 MHz = GPLL0 (800 MHz) / 10 */
 +	v = usbcon_gcc_rd(0x14);
 +	v &= ~((0x7u << 8) | 0x1fu);
@@ -1446,7 +1479,7 @@ index 3e70e3f..96b1e6a 100644
  #ifdef SHMCON
  
  #define CPU_CACHELINE_SIZE      (1 << MMU_CLINE)
-@@ -383,7 +1221,9 @@ shmcon_init(void)
+@@ -383,7 +1232,9 @@ shmcon_init(void)
  	pa_panic_base = reg_prop[0];
  	panic_size = reg_prop[1];
  
@@ -1457,7 +1490,7 @@ index 3e70e3f..96b1e6a 100644
  	header_size = sizeof(*shmcon) + (NUM_CHILDREN * sizeof(shmcon->child[0]));
  	va_buffer_base = ROUNDUP((uintptr_t)(shmcon) + header_size, CPU_CACHELINE_SIZE);
  	va_buffer_end  = (uintptr_t)shmcon + panic_size - (sizeof(*end));
-@@ -799,6 +1639,9 @@ serial_init(void)
+@@ -799,6 +1650,9 @@ serial_init(void)
  #ifdef SHMCON
  	uint32_t        jconmode;
  #endif
@@ -1467,7 +1500,7 @@ index 3e70e3f..96b1e6a 100644
  #ifdef DOCKFIFO_UART
  	uint32_t        no_dockfifo_uart;
  #endif
-@@ -821,6 +1664,15 @@ serial_init(void)
+@@ -821,6 +1675,15 @@ serial_init(void)
  		uart_initted = 1;
  		return 1;
  	}

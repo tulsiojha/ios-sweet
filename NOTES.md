@@ -481,6 +481,51 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   test. Reading: USB re-enumerates (USBCMD.RESET) and `xnu> arm_init` prints ->
   clock re-init was the hang; tty stays silent -> the GCC read itself or a later
   step is at fault, next beacon goes right after usbcon_clocks_init.
+- **v22 TEST (2026-11-06 23:39): clock skip did NOT change anything - identical
+  silent hang.** `out/vivo-boot-noclkreset.img` (97469bbc...74e2) flashed OKAY
+  (send 0.922 s, write 0.687 s), `fastboot reboot`; stage0 streamed the full
+  probe and `loader: jumping to 00000000890f90a0 el=0000000000000001`
+  (/tmp/vivo-v22.log), then ZERO bytes: the tty stayed open the whole run and
+  the device stayed `vivo Y21L stage0` (kUSBAddress 1) - no USBCMD.RESET, so
+  `usbcon_hw_init` still never reached the reset. New tool
+  `tools/vivo-console-watch.py` (start it BEFORE rebooting: unlike
+  vivo-console-read.py it polls for the tty, survives re-enumeration and logs
+  open/close with timestamps, which is what tells RESET from hang).
+- **ROOT CAUSE FOUND (2026-11-06, static): CPACR_EL1.FPEN is never enabled, so
+  xnu's FIRST NEON instruction traps into an unprepared vector path.** start.s
+  only enables NEON under
+  `#if (!CONFIG_KERNEL_INTEGRITY || (CONFIG_KERNEL_INTEGRITY && !defined(KERNEL_INTEGRITY_WT)))`,
+  and the T7000 board config (pexpert/pexpert/arm64/board_config.h,
+  ARM64_BOARD_CONFIG_T7000) defines KERNEL_INTEGRITY_WT: on Apple hardware the
+  Watchtower monitor sets CPACR_EL1, so the write is compiled out. VERIFIED:
+  the old start.o contained zero `msr cpacr_el1` instructions and the old
+  kernel had exactly one (from locore.s, far too late). On msm8916 nothing
+  enables FP, so FPEN stays at the ARM reset value 0 and any SIMD access at EL1
+  raises EC 0x07; with no usable vectors yet (VBAR is set later in the boot
+  path and gets no further than ExceptionVectorsBase) it reads as a silent
+  hang. The first SIMD instruction on the path is `ldr q0` at
+  _usbcon_hw_init+0x14 (compiler vectorised the three descriptor-string
+  copies), i.e. exactly the v19-v22 early console - which is why OSLAR and the
+  clock re-init both looked like the culprit and both changed nothing.
+  Cross-checks: stage0's payload contains ZERO SIMD instructions (scan of
+  out/stage0v5.bin), so stage0 never tripped it; Linux writes CPACR_EL1 in
+  head.S on this same firmware and Android boots, so an EL1 write is allowed
+  (CPTR_EL2.TFP is not trapping); v21's pshold beacon sat before any SIMD,
+  which is why it powered off. OSLAR and clock-reinit changes are kept.
+- **FIX v23 (built, NOT yet flashed): enable FP/SIMD under MSM8916_PORT.**
+  start.s now writes `CPACR_EL1 = CPACR_FPEN_ENABLE (3 << 20)` + `isb` in a
+  `#if defined(MSM8916_PORT)` block right after the compiled-out one. Local
+  build EXIT=0, kernel 10,210,160 B (+8), start.o now has the instruction and
+  the final kernel has 2 `msr cpacr_el1,x0`. Image
+  `ports/vivo-y21l/out/vivo-boot-fp.img` 29,154,538 B, sha256
+  7ae128faedaae73fe54932c7d116ab1423cd1b25b54a01071f5846a0dcab3e13 (payload
+  10,217,024 B, dt moved 0xb4b800 -> 0x1187800). Repo patch regenerated:
+  1606 lines / 17 files, `git apply --check` clean on a fresh 494ffe1.
+  Reading: tty closes within ~1 s of `loader: jumping` and the device comes
+  back as `vivo Y21L xnu` with `xnu> arm_init` -> FP was the blocker and the
+  early console works; still silent with the tty held open -> next beacon goes
+  inside usbcon_hw_init (GCC read / bzero / reset), with EL2 CPTR_EL2.TFP as
+  the remote second suspect.
 - **Port deltas vs sweet:** 32-bit stage0 (real one) must switch AArch32 EL2 -> AArch64
   (lk2nd-style HCR.RW + eret) and then jump to the AArch64 payload; SDHCI eMMC driver,
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
