@@ -1,5 +1,5 @@
 /*
- * stage0 v8 AArch64 payload: polled ChipIdea USB device-mode console plus
+ * stage0 v9 AArch64 payload: polled ChipIdea USB device-mode console plus
  * an SDHCI eMMC block layer (8-bit/HS switch, multi-block reads, GPT scan).
  *
  * Runs at EL1 with the MMU and caches off, entered at 0x8000a000 by the
@@ -22,7 +22,13 @@
  * bus + high speed (CMD6), raises SDCC1 to 25 MHz, verifies with a fresh
  * LBA0 read (falling back to 1-bit/390 kHz on failure) and finally reads
  * the GPT entry array with CMD23 + a multi-block CMD18, listing the
- * named partitions. Everything is polled; the GIC stays off.
+ * named partitions.
+ *
+ * v9 turns the GICv2 on: distributor 0x0b000000 / CPU interface 0x0b002000,
+ * PPI 30 (non-secure physical arch timer) as a group-1 interrupt, 1 ms
+ * CNTP tick. IRQs are unmasked only after the GIC is configured; USB and
+ * SDCC stay polled, the handler just rearms the timer and counts, and the
+ * main loop logs the observed rate. Fault vectors decode ESR_EL1.
  */
 
 #include <stdarg.h>
@@ -852,6 +858,103 @@ static void gic_disable_and_log(void)
 	barrier();
 }
 
+/* ---------------- GICv2 + arch timer interrupt ---------------- */
+
+#define GICD_BASE 0x0b000000ull
+#define GICC_BASE 0x0b002000ull
+#define TIMER_PPI 30		/* non-secure physical timer PPI */
+
+static volatile u32 g_irq_count, g_irq_other, g_irq_spurious;
+static u32 g_timer_tval;
+
+/*
+ * Called from irq_entry (entry.S), DAIF.I masked. Ack, rearm for the
+ * timer, EOI; unknown sources get disabled so they cannot storm.
+ */
+void irq_handler(void)
+{
+	u32 iar = rd(GICC_BASE + 0x0c);
+	u32 id = iar & 0x3ff;
+
+	if (id >= 1020) {
+		g_irq_spurious++;
+		return;
+	}
+	if (id == TIMER_PPI) {
+		__asm__ volatile("msr cntp_tval_el0, %0" ::
+				 "r"((u64)g_timer_tval));
+		g_irq_count++;
+	} else {
+		g_irq_other++;
+		wr(GICD_BASE + 0x180 + (id / 32) * 4, 1u << (id % 32));
+	}
+	wr(GICC_BASE + 0x10, iar);	/* EOIR: drop priority, deactivate */
+}
+
+static void gic_irq_start(void)
+{
+	u64 frq, ctl;
+	u32 i;
+
+	wr(GICC_BASE, 0);
+	wr(GICD_BASE, 0);
+	for (i = 0; i < 32; i++) {
+		wr(GICD_BASE + 0x180 + 4 * i, 0xffffffff);
+		wr(GICD_BASE + 0x280 + 4 * i, 0xffffffff);
+	}
+	for (i = 0; i < 64; i++)
+		wr(GICD_BASE + 0x400 + 4 * i, 0xa0a0a0a0);
+	for (i = 0; i < 8; i++)
+		wr(GICD_BASE + 0x800 + 4 * i, 0x01010101);
+	wr(GICD_BASE + 0x080, rd(GICD_BASE + 0x080) | (1u << TIMER_PPI));
+	wr(GICD_BASE + 0x100, 1u << TIMER_PPI);
+	wr(GICD_BASE, 1);		/* enable group 1 */
+	wr(GICC_BASE + 0x04, 0xf0);	/* priority mask */
+	wr(GICC_BASE, 1);		/* enable group 1 */
+	barrier();
+
+	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
+	g_timer_tval = (u32)(frq / 1000);
+	__asm__ volatile("msr cntp_tval_el0, %0" :: "r"((u64)g_timer_tval));
+	__asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(1ull));
+	__asm__ volatile("isb" ::: "memory");
+	__asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(ctl));
+
+	log_printf("gic: on ctlr=%x cpu=%x pmr=%x group0=%x isen0=%x\n",
+		   rd(GICD_BASE), rd(GICC_BASE), rd(GICC_BASE + 0x04),
+		   rd(GICD_BASE + 0x080), rd(GICD_BASE + 0x100));
+	log_printf("timer: ppi=%u tval=%u ctl=%lx cnt=%x\n", TIMER_PPI,
+		   g_timer_tval, ctl, ticks());
+
+	__asm__ volatile("msr daifclr, #2" ::: "memory");
+	log_puts("irq: unmasked\n");
+}
+
+/* observed tick rate vs the wall clock, every 5 s */
+static void irq_tick(void)
+{
+	static u32 t0, c0;
+
+	if (!g_timer_tval)
+		return;
+	if (!t0) {
+		t0 = ticks();
+		c0 = g_irq_count;
+		return;
+	}
+	if (elapsed_ms(t0) < 5000)
+		return;
+	{
+		u32 ms = elapsed_ms(t0);
+
+		log_printf("irq: %u ticks in %u ms other=%u spur=%u\n",
+			   g_irq_count - c0, ms, g_irq_other,
+			   g_irq_spurious);
+	}
+	t0 = ticks();
+	c0 = g_irq_count;
+}
+
 static void usb_hw_init(void)
 {
 	wr(USB_BASE + USB_USBCMD, USBCMD_ITC8_RST);
@@ -1653,14 +1756,14 @@ static void boot_replay(void)
 		return;
 	last = ticks();
 
-	log_printf("\n-- v8 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
+	log_printf("\n-- v9 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
 		   g_boot_dtb, g_boot_dtb_ok ? "ok" : "bad",
 		   g_boot_midr, g_boot_cntfrq, g_tick_ms);
-	log_printf("-- wdt_en=%x usb=%s emmc=%s fast=%x\n", g_boot_wdt_en,
+	log_printf("-- wdt_en=%x usb=%s emmc=%s fast=%x irq=%u\n", g_boot_wdt_en,
 		   g_configured ? (bus_highspeed() ? "hs" : "fs") : "off",
 		   g_emmc_state == 0 ? "ok" : (g_emmc_state == 0xffff ?
 					       "not probed" : "failed"),
-		   g_emmc_fast);
+		   g_emmc_fast, g_irq_count);
 }
 
 /* run once, 20 s in, so the host can open the port and see the log live
@@ -1800,7 +1903,7 @@ static void fdt_dump(u64 dtb)
 
 /* ---------------- main ---------------- */
 
-void exc_report(u64 esr, u64 elr, u64 far)
+void exc_report(u64 esr, u64 elr, u64 far, u64 spsr)
 {
 	static volatile int busy;
 
@@ -1808,7 +1911,10 @@ void exc_report(u64 esr, u64 elr, u64 far)
 		for (;;)
 			;
 	busy = 1;
-	log_printf("\n!!! exception esr=%lx elr=%lx far=%lx\n", esr, elr, far);
+	log_printf("\n!!! exception esr=%lx elr=%lx far=%lx spsr=%lx\n",
+		   esr, elr, far, spsr);
+	log_printf("!!! ec=%lx il=%u iss=%lx\n", (esr >> 26) & 0x3f,
+		   (u32)(esr >> 25) & 1, esr & 0x1ffffff);
 	if (g_configured) {
 		u32 s = ticks();
 		while (elapsed_ms(s) < 300) {
@@ -1832,9 +1938,9 @@ static void heartbeat(void)
 		if (++spin & 0xfffff)
 			return;
 	}
-	log_printf("hb %u drops %u sts %x portsc %x\n", hb++,
+	log_printf("hb %u drops %u sts %x portsc %x irq %u\n", hb++,
 		   g_ring_drops, rd(USB_BASE + USB_USBSTS),
-		   rd(USB_BASE + USB_PORTSC));
+		   rd(USB_BASE + USB_PORTSC), g_irq_count);
 }
 
 static void status_tick(void)
@@ -1867,7 +1973,7 @@ void kmain(u64 dtb)
 	__asm__ volatile("mrs %0, midr_el1" : "=r"(midr));
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
 
-	log_printf("\nios-sweet vivo Y21L stage0 v8: AArch64 payload\n");
+	log_printf("\nios-sweet vivo Y21L stage0 v9: AArch64 payload\n");
 	g_boot_dtb = dtb;
 	g_boot_cntfrq = cntfrq;
 	g_boot_midr = (u32)midr;
@@ -1897,10 +2003,13 @@ void kmain(u64 dtb)
 
 	log_printf("usb: waiting for host enumeration\n");
 
+	gic_irq_start();
+
 	for (;;) {
 		usb_poll();
 		usb_pump();
 		probe_tick();
+		irq_tick();
 		heartbeat();
 		status_tick();
 	}
