@@ -1,5 +1,5 @@
 /*
- * stage0 v9 AArch64 payload: polled ChipIdea USB device-mode console plus
+ * stage0 v10 AArch64 payload: polled ChipIdea USB device-mode console plus
  * an SDHCI eMMC block layer (8-bit/HS switch, multi-block reads, GPT scan).
  *
  * Runs at EL1 with the MMU and caches off, entered at 0x8000a000 by the
@@ -24,11 +24,15 @@
  * the GPT entry array with CMD23 + a multi-block CMD18, listing the
  * named partitions.
  *
- * v9 turns the GICv2 on: distributor 0x0b000000 / CPU interface 0x0b002000,
- * PPI 30 (non-secure physical arch timer) as a group-1 interrupt, 1 ms
- * CNTP tick. IRQs are unmasked only after the GIC is configured; USB and
- * SDCC stay polled, the handler just rearms the timer and counts, and the
- * main loop logs the observed rate. Fault vectors decode ESR_EL1.
+ * v9/v10 turn the GICv2 on: distributor 0x0b000000 / CPU interface
+ * 0x0b002000, 1 ms CNTP tick, IRQs unmasked only after the GIC is
+ * configured. v9 enabled PPI 30 (non-secure physical timer) and no IRQ
+ * ever arrived while GICD/GICC_CTLR bit0 and ISENABLER read back as
+ * written - that combination means the payload runs at Secure EL1, so
+ * the CNTP timer raises PPI 29 (secure physical timer), not 30. v10
+ * enables both and logs which one fires, plus GICD IIDR/TYPER and, on
+ * an idle window, CNTP_CTL/HPPIR/RPR. USB and SDCC stay polled; the
+ * handler just rearms the timer and counts. Fault vectors decode ESR_EL1.
  */
 
 #include <stdarg.h>
@@ -862,9 +866,10 @@ static void gic_disable_and_log(void)
 
 #define GICD_BASE 0x0b000000ull
 #define GICC_BASE 0x0b002000ull
-#define TIMER_PPI 30		/* non-secure physical timer PPI */
+#define TIMER_PPI_NS 30		/* non-secure physical timer PPI */
+#define TIMER_PPI_S 29		/* secure physical timer PPI */
 
-static volatile u32 g_irq_count, g_irq_other, g_irq_spurious;
+static volatile u32 g_irq_count, g_irq_other, g_irq_spurious, g_irq_id;
 static u32 g_timer_tval;
 
 /*
@@ -880,9 +885,11 @@ void irq_handler(void)
 		g_irq_spurious++;
 		return;
 	}
-	if (id == TIMER_PPI) {
+	if (id == TIMER_PPI_NS || id == TIMER_PPI_S) {
 		__asm__ volatile("msr cntp_tval_el0, %0" ::
 				 "r"((u64)g_timer_tval));
+		if (!g_irq_count)
+			g_irq_id = id;
 		g_irq_count++;
 	} else {
 		g_irq_other++;
@@ -894,7 +901,7 @@ void irq_handler(void)
 static void gic_irq_start(void)
 {
 	u64 frq, ctl;
-	u32 i;
+	u32 i, grp0, grp1;
 
 	wr(GICC_BASE, 0);
 	wr(GICD_BASE, 0);
@@ -906,11 +913,13 @@ static void gic_irq_start(void)
 		wr(GICD_BASE + 0x400 + 4 * i, 0xa0a0a0a0);
 	for (i = 0; i < 8; i++)
 		wr(GICD_BASE + 0x800 + 4 * i, 0x01010101);
-	wr(GICD_BASE + 0x080, rd(GICD_BASE + 0x080) | (1u << TIMER_PPI));
-	wr(GICD_BASE + 0x100, 1u << TIMER_PPI);
-	wr(GICD_BASE, 1);		/* enable group 1 */
+	grp0 = rd(GICD_BASE + 0x080);
+	wr(GICD_BASE + 0x080, 0xffffffff);
+	grp1 = rd(GICD_BASE + 0x080);
+	wr(GICD_BASE + 0x100, (1u << TIMER_PPI_NS) | (1u << TIMER_PPI_S));
+	wr(GICD_BASE, 3);		/* group0|group1 enable, or GICv1 bit0 */
 	wr(GICC_BASE + 0x04, 0xf0);	/* priority mask */
-	wr(GICC_BASE, 1);		/* enable group 1 */
+	wr(GICC_BASE, 3);
 	barrier();
 
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frq));
@@ -920,11 +929,13 @@ static void gic_irq_start(void)
 	__asm__ volatile("isb" ::: "memory");
 	__asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(ctl));
 
-	log_printf("gic: on ctlr=%x cpu=%x pmr=%x group0=%x isen0=%x\n",
+	log_printf("gic: on ctlr=%x cpu=%x pmr=%x group=%x->%x isen0=%x\n",
 		   rd(GICD_BASE), rd(GICC_BASE), rd(GICC_BASE + 0x04),
-		   rd(GICD_BASE + 0x080), rd(GICD_BASE + 0x100));
-	log_printf("timer: ppi=%u tval=%u ctl=%lx cnt=%x\n", TIMER_PPI,
-		   g_timer_tval, ctl, ticks());
+		   grp0, grp1, rd(GICD_BASE + 0x100));
+	log_printf("gic: iidr=%x typer=%x\n", rd(GICD_BASE + 0x08),
+		   rd(GICD_BASE + 0x04));
+	log_printf("timer: ppi=%u/%u tval=%u ctl=%lx cnt=%x\n", TIMER_PPI_S,
+		   TIMER_PPI_NS, g_timer_tval, ctl, ticks());
 
 	__asm__ volatile("msr daifclr, #2" ::: "memory");
 	log_puts("irq: unmasked\n");
@@ -947,9 +958,18 @@ static void irq_tick(void)
 	{
 		u32 ms = elapsed_ms(t0);
 
-		log_printf("irq: %u ticks in %u ms other=%u spur=%u\n",
-			   g_irq_count - c0, ms, g_irq_other,
-			   g_irq_spurious);
+		if (g_irq_count - c0) {
+			log_printf("irq: %u ticks in %u ms id=%u other=%u spur=%u\n",
+				   g_irq_count - c0, ms, g_irq_id, g_irq_other,
+				   g_irq_spurious);
+		} else {
+			u64 ctl;
+
+			__asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(ctl));
+			log_printf("irq: 0 in %u ms ctl=%lx hppir=%x rpr=%x\n",
+				   ms, ctl, rd(GICC_BASE + 0x18),
+				   rd(GICC_BASE + 0x14));
+		}
 	}
 	t0 = ticks();
 	c0 = g_irq_count;
@@ -1756,7 +1776,7 @@ static void boot_replay(void)
 		return;
 	last = ticks();
 
-	log_printf("\n-- v9 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
+	log_printf("\n-- v10 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
 		   g_boot_dtb, g_boot_dtb_ok ? "ok" : "bad",
 		   g_boot_midr, g_boot_cntfrq, g_tick_ms);
 	log_printf("-- wdt_en=%x usb=%s emmc=%s fast=%x irq=%u\n", g_boot_wdt_en,
@@ -1973,7 +1993,7 @@ void kmain(u64 dtb)
 	__asm__ volatile("mrs %0, midr_el1" : "=r"(midr));
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
 
-	log_printf("\nios-sweet vivo Y21L stage0 v9: AArch64 payload\n");
+	log_printf("\nios-sweet vivo Y21L stage0 v10: AArch64 payload\n");
 	g_boot_dtb = dtb;
 	g_boot_cntfrq = cntfrq;
 	g_boot_midr = (u32)midr;

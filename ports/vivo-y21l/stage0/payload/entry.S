@@ -1,5 +1,5 @@
 /*
- * stage0 v9 AArch64 entry. The QSEE monitor erets here at EL1 with
+ * stage0 v9+ AArch64 entry. The QSEE monitor erets here at EL1 with
  * x0 = dtb physical address, MMU and caches off, VA = PA.
  *
  * Only the current-EL/SPx IRQ vector is wired to a real handler (the

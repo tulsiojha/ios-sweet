@@ -142,6 +142,18 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   stock LK ignores it too.** Bytes 176..191 as words: 38000000 00000000 00000001 00000000.
   Stock boot.img restored after the v8 test (fastboot flash boot + reboot, 2026-11-06);
   Android 5.1.1 is back online via adb.
+- **IRQ bring-up v9 (2026-11-06):** real vector table (IRQ at current-EL/SPx ->
+  irq_entry spilling x0-x18/x30; faults also report SPSR + decoded ESR) and GICv2 init
+  with a 1 ms CNTP tick. First hardware run: GICD/GICC_CTLR bit0 write+readback = 1,
+  PMR 0xF0, ISENABLER0 = 0x40000000 (PPI 30), `timer: tval=19200 ctl=1`, but **0 IRQs
+  in 150 s** (`irq: 0 ticks in 5000 ms` repeatedly) while the eMMC 8-bit HS + GPT scan
+  still passed. IGROUPR0 reads 0 and ignores a bit30 write. Observation: this matches a
+  Secure EL1 entry (QSEE elexec) with a GICv1-style secure view, not NS EL1 - at S-EL1
+  the CNTP timer raises **PPI 29** (secure physical timer), not 30. v10 enables PPI 29
+  and 30, logs which id fires plus GICD IIDR/TYPER and CNTP_CTL/HPPIR/RPR when idle
+  (`vivo-test10-boot.img` sha256 7aa0ed9d...8625, built, not yet flashed). Torn-down
+  next step after that: decide whether to keep running S-EL1 or drop to NS EL1 for the
+  kernel handoff.
 - **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
   iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
   xnu-8796 + iOS 12 userland vs port xnu-4903).
