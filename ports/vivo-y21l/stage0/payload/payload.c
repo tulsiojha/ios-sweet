@@ -193,6 +193,16 @@ static void log_dec(u32 v)
 		log_putc(b[i]);
 }
 
+static void log_strn(const char *s, u32 max)
+{
+	u32 i;
+
+	for (i = 0; i < max && s[i]; i++) {
+		char c = s[i];
+		log_putc((c >= 0x20 && c <= 0x7e) ? c : '.');
+	}
+}
+
 void log_printf(const char *fmt, ...)
 {
 	va_list ap;
@@ -1377,6 +1387,119 @@ static void probe_tick(void)
 	emmc_probe();
 }
 
+/* ---------------- device tree dump ---------------- */
+
+static u32 bswap32(u32 v)
+{
+	return (v >> 24) | ((v >> 8) & 0xff00) |
+	       ((v << 8) & 0xff0000) | (v << 24);
+}
+
+static int str_eq(const char *a, const char *b)
+{
+	while (*a && *a == *b) {
+		a++;
+		b++;
+	}
+	return *a == *b;
+}
+
+static int str_prefix(const char *a, const char *b, u32 n)
+{
+	u32 i;
+
+	for (i = 0; i < n; i++)
+		if (a[i] != b[i])
+			return 0;
+	return 1;
+}
+
+/* bounded walk of the FDT LK hands over in x0; logs model, bootargs and
+ * the patched /memory reg */
+static void fdt_dump(u64 dtb)
+{
+	u32 *h = (u32 *)(u64)dtb;
+	u32 magic = bswap32(h[0]);
+	u32 total, off_struct, off_strings, version;
+	const u8 *base = (const u8 *)(u64)dtb;
+	const u8 *p, *end, *strs;
+	const char *nodename = "";
+	u32 nodename_len = 0;
+	u32 depth = 0;
+
+	log_printf("fdt: raw %x %x %x %x\n", h[0], h[1], h[2], h[3]);
+	if (magic != 0xd00dfeedu) {
+		log_printf("fdt: no fdt at %lx (magic %x)\n", dtb, magic);
+		return;
+	}
+	total = bswap32(h[1]);
+	off_struct = bswap32(h[2]);
+	off_strings = bswap32(h[3]);
+	version = bswap32(h[5]);
+	log_printf("fdt: total=%u ver=%u struct=%x strings=%x\n",
+		   total, version, off_struct, off_strings);
+	if (total < 0x40 || total > 0x400000 ||
+	    off_struct >= total || off_strings >= total)
+		return;
+
+	p = base + off_struct;
+	end = base + total;
+	strs = base + off_strings;
+
+	while (p + 4 <= end) {
+		u32 tag = bswap32(*(const u32 *)p);
+
+		p += 4;
+		if (tag == 1) {			/* FDT_BEGIN_NODE */
+			nodename = (const char *)p;
+			nodename_len = 0;
+			while (p < end && *p) {
+				p++;
+				nodename_len++;
+			}
+			p++;
+			p = (const u8 *)(((u64)p + 3) & ~3ull);
+			depth++;
+		} else if (tag == 2) {		/* FDT_END_NODE */
+			if (depth)
+				depth--;
+		} else if (tag == 4) {		/* FDT_NOP */
+			;
+		} else if (tag == 9) {		/* FDT_END */
+			break;
+		} else if (tag == 3 && p + 8 <= end) {
+			u32 len = bswap32(*(const u32 *)p);
+			u32 nameoff = bswap32(*(const u32 *)(p + 4));
+			const u8 *data = p + 8;
+			const char *name;
+
+			p = data + ((len + 3) & ~3u);
+			if (p > end || off_strings + nameoff >= total)
+				break;
+			name = (const char *)(strs + nameoff);
+
+			if (str_eq(name, "model")) {
+				log_puts("fdt: model=");
+				log_strn((const char *)data, len);
+				log_putc('\n');
+			} else if (str_eq(name, "bootargs")) {
+				log_puts("fdt: bootargs=");
+				log_strn((const char *)data, len);
+				log_putc('\n');
+			} else if (str_eq(name, "reg") && depth == 2 &&
+				   nodename_len >= 6 &&
+				   str_prefix(nodename, "memory", 6) &&
+				   len == 16) {
+				log_printf("fdt: memory %x+%x\n",
+					   bswap32(*(const u32 *)(data + 4)),
+					   bswap32(*(const u32 *)(data + 12)));
+			}
+		} else {
+			break;
+		}
+	}
+}
+
 /* ---------------- main ---------------- */
 
 void exc_report(u64 esr, u64 elr, u64 far)
@@ -1461,6 +1584,8 @@ void kmain(u64 dtb)
 	}
 	log_printf("mpidr=%lx midr=%x cntfrq=%lx tick_ms=%u\n",
 		   mpidr, (u32)midr, cntfrq, g_tick_ms);
+	if (dtb >= 0x80000000ull && dtb < 0xc0000000ull)
+		fdt_dump(dtb);
 
 	build_string(g_str_mfr, &g_str_mfr_len, "ios-sweet");
 	build_string(g_str_prod, &g_str_prod_len, "vivo Y21L stage0");

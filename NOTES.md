@@ -2,8 +2,9 @@
 
 ## NEW PORT (2026-11-06): iOS 12 on vivo Y21L (MSM8916) - read first
 
-Second target, separate from sweet. Phone serial c25ac45b; DTB copied to `vivo.dtb`
-(repo root, gitignored). Full adb dump in `device-info/vivo-y21l-profile.md` (gitignored).
+Second target, separate from sweet. Phone serial known locally only (not recorded here);
+DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
+`device-info/vivo-y21l-profile.md` (gitignored).
 
 - **Hardware:** vivo Y21L (PD1309F), MSM8916, 4x Cortex-A53, ~920 MiB RAM, 16 GB eMMC
   (SDHCI @0x7824900), 480x854 command-mode DSI NT35510S panel, Synaptics RMI4 S3202 touch
@@ -85,7 +86,20 @@ Second target, separate from sweet. Phone serial c25ac45b; DTB copied to `vivo.d
   (stock boot header), where DEVICE_TREE LK memmoves the matched DTB (to be confirmed on
   the next flash). Images: v6 `vivo-test6-boot.img` sha256 4deb416b...e665b6 (flashed for
   this test), v6b `vivo-test6b-boot.img` sha256 0035c5e8...ca782 (built, not yet flashed).
-  Stock boot.img restored, Android 5.1.1 back (adb c25ac45b).
+  Stock boot.img restored, Android 5.1.1 back (adb online).
+- **DTB HANDOFF CONFIRMED (2026-11-06, stage0 v6c):** x0 really is LK's patched
+  device tree at 0x81E00000 (`tags_addr` from the stock boot header, r2 of LK's 32-bit
+  entry). FDT header: total 182,705 B, version 17, struct at 0x38, strings at 0x27C90;
+  `model=Qualcomm Technologies, Inc. MSM 8916 MTP - PD1309F_EX`;
+  bootargs carry the bbk_* product ids, `bootreason=65`, an androidboot serial and
+  `mdss_mdp.panel=1:dsi:0:qcom,mdss_dsi_nt35510s_fwvga_cmd_tm:1:none` (panel name for the
+  display milestone); `/memory` reg = 0x80000000+0x40000000 (1 GiB node; usable is less
+  after carveouts). With the endian-fixed check the boot log prints `magic ok`, the eMMC
+  probe prints `gpt=yes`, and the boot-info replay fires once under macOS's ~8
+  SET_LINE_CODINGs (5 s throttle works). Payload now has a bounded FDT walker
+  (`fdt_dump`, BE reads, token walk, logs model/bootargs//memory reg). Image
+  `device-info/vivo-stock/vivo-test6c-boot.img` sha256 40804d79...f250. Stock restored,
+  Android 5.1.1 back (adb online).
 - **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
   iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
   xnu-8796 + iOS 12 userland vs port xnu-4903).
@@ -94,16 +108,14 @@ Second target, separate from sweet. Phone serial c25ac45b; DTB copied to `vivo.d
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) flash v6b to confirm the dtb magic check, `gpt=yes` and the single
-  replay, and dump the FDT header at 0x81E00000 (totalsize/model) for the kernel handoff;
-  (2) SDHCI block layer: multi-block CMD18/CMD23, then 8-bit/HS timing, and GPT parsing
-  (LBA2 entries) so the payload can read the root image; (3) GICv2 + arch timer +
-  exception handling when IRQs are needed (until then IRQs stay masked and the GIC off);
-  (4) sweet-style payload pipeline (mkpayload) for this device; (5) msm8916 ADT generator;
-  (6) iOS 12 root image into userdata (destructive, confirm first). BLSP1 UART2 stays a
-  fallback (GCC clocks needed, pins probably not exposed). Reference for the SCM path:
-  lk2nd `platform/msm_shared/scm.c` + `app/aboot/aboot.c` (cloned at /tmp/lk2nd, not in
-  git).
+- **Next steps:** (1) SDHCI block layer: multi-block CMD18/CMD23, then 8-bit/HS timing,
+  and GPT parsing (LBA2 entries) so the payload can read named partitions; (2) GICv2 +
+  arch timer + exception handling when IRQs are needed (until then IRQs stay masked and
+  the GIC off); (3) sweet-style payload pipeline (mkpayload) for this device; (4) msm8916
+  ADT generator; (5) iOS 12 root image into userdata (destructive, confirm first).
+  BLSP1 UART2 stays a fallback (GCC clocks needed, pins probably not exposed). Reference
+  for the SCM path: lk2nd `platform/msm_shared/scm.c` + `app/aboot/aboot.c` (cloned at
+  /tmp/lk2nd, not in git).
 - This Mac session has no cross gcc + no gh CLI; kernel builds still go through the public
   repo's GitHub Actions (`dipa-studio/ios-sweet`).
 
