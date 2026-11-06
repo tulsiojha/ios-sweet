@@ -372,6 +372,42 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   `debug=0x8 serial=3 keepsyms=1 usbcon=1`). Patch regenerated:
   ports/vivo-y21l/xnu-4903-arm64-oss-build.patch 1551 lines / 17 files,
   verified applying clean to a fresh 494ffe1 clone (git apply --check).
+- **v19 EARLY-CONSOLE TEST (2026-11-06 22:31): still silent - xnu dies before the
+  first probe.** out/vivo-boot-earlycon.img (067d0ecb...9fe1) flashed OKAY (send
+  0.896 s, write 0.686 s), `fastboot reboot` OKAY; stage0 streamed its full probe
+  (eMMC/GPT, loader segs, `loader: jumping to 00000000890f90a0`, /tmp/vivo-v19.log)
+  and then NOTHING: no "xnu> arm_init", macOS kept "vivo Y21L stage0" (kUSBAddress 1)
+  - the early console never ran and the controller was never reset. So the hang is
+  between the jump and usbcon_early_start (i.e. in start.s or the first lines of
+  arm_init), not later.
+- **ROOT-CAUSE CANDIDATE: `msr OSLAR_EL1, xzr` as xnu's FIRST instruction
+  (2026-11-06, from the built kernel's disassembly).** `__start` (0x...70f90a0)
+  branches to `_start_first_cpu`, which begins with the ARM debug OS-lock write
+  (encoding 0xd510109f; both here and in LowResetVectorBase - Apple inherited it
+  from generic ARM code, it is not Apple-specific). At NS EL1 that access is
+  trapped to EL2 when MDCR_EL2.TDOSA=1, which locked-down Qualcomm firmware
+  commonly sets. This boot flow never sets up EL2 (QSEE erets straight to EL1),
+  so a trap lands in an uninitialised EL2 vector -> silent hang; stage0's EL1
+  fault vectors do NOT fire, which matches the zero output. The payload itself is
+  at NS EL1 (the v9-v14 1 kHz tick was delivered through VBAR_EL1, which only
+  takes effect from EL1), so the "xnu started at EL2" theory is ruled out. Every
+  other system register on the path was checked in the binary and is plain
+  ARMv8.0/A53-safe: TCR 0x22A51A251A (T0SZ=T1SZ=26, TG 4K, IPS 40-bit),
+  SCTLR 0x3454593d, TTBR0=topOfKernelData V=P, TTBR1=KVA, MAIR attr3=0x44.
+  The 5th-page GCC/USB/QGIC block insert is also correct in the image (verified
+  in the disassembly: L1 slot 12 -> new L2 at x25+0x4000, entries #0x60/#0x1e0/
+  #0x2c0 with 0x40d templates).
+- **FIX BUILT (v20, 2026-11-06): skip the OSLAR writes under MSM8916_PORT.**
+  start.s now guards both `msr OSLAR_EL1, xzr` with `#if !defined(MSM8916_PORT)`
+  (the write only unlocks debug; skipping it is harmless). Stage0's loader now
+  prints `el=` (CurrentEL) on the `jumping` line as a cross-check. Local build
+  EXIT=0; disassembly confirms `_start_first_cpu` now starts with `msr DAIFSet`
+  and the whole kernel contains zero 0xd510109f. Image
+  `out/vivo-boot-oslarfix.img` 29,154,538 B, sha256 c28be0c2...c81f (stage0v5
+  40,424 B, payload 10,217,024 B). Patch regenerated (1573 lines, 17 files,
+  applies clean to a fresh 494ffe1 clone). NOT yet flashed: after the v19 test
+  the phone dropped off USB entirely (no fastboot, no tty, no stage0 device in
+  ioreg) and needs the user to power it back into fastboot.
   CI: `.github/workflows/xnu-4903.yml` (commit 8eedd8f) applies the patch to a fresh
   494ffe1 clone and builds on `macos-15-intel`. `macos-14` now resolves to
   `macos-14-arm64-us-default`, a configuration this repo cannot use ("The configuration
@@ -395,12 +431,12 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) flash-test the early-console image (`fastboot flash boot
-  out/vivo-boot-earlycon.img`, needs the user in fastboot; phone currently runs
-  the hung msmport image) and read `tools/vivo-console-read.py` (raw, nonblocking;
-  plain cat blocks on this macOS CDC tty) while the phone boots: the "xnu>"
-  probes say where execution stops, or an empty tty says the early console
-  itself needs debugging; (2) compare the CI artifact with the local kernel;
+- **Next steps:** (1) flash-test the oslarfix image (`fastboot flash boot
+  out/vivo-boot-oslarfix.img`; phone must be re-entered into fastboot) and read
+  `tools/vivo-console-read.py` (raw, nonblocking; plain cat blocks on this macOS
+  CDC tty) while it boots: the early-console "xnu>" probes say whether the OSLAR
+  skip fixed the hang and, if not, where execution stops; the loader's `el=`
+  field confirms the entry EL; (2) compare the CI artifact with the local kernel;
   (3) implement GICv2 + arch timer (PPI 19) behind ml_irq/IOCPU plus an FDT
   platform expert for our ADT (AIC will not be used); (4) take
   ADT shapes from a real D10AP/iOS 12 device tree (Apple artifact, keep out of git);

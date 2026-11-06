@@ -55,6 +55,14 @@ extern void log_drain(u32 ms);
 
 typedef void (*xnu_entry_t)(u64 boot_args_pa);
 
+static u64 current_el(void)
+{
+	u64 v;
+
+	__asm__ volatile("mrs %0, CurrentEL" : "=r"(v));
+	return v >> 2;
+}
+
 /* MMU off: everything is Device memory, so move aligned 8-byte words. */
 static void copy64(u64 dst, u64 src, u64 n)
 {
@@ -208,7 +216,7 @@ const char *loader_boot(void)
 		   adt_pa, ba_pa, top, p->cmdline);
 
 	entry_pa = p->entry_va + pa_of_va_base;
-	log_printf("loader: jumping to %lx\n", entry_pa);
+	log_printf("loader: jumping to %lx el=%lx\n", entry_pa, current_el());
 	log_drain(1500);
 
 	/* MMU/caches off writes; drop stale I-cache lines like sweet's shim. */

@@ -494,7 +494,7 @@ index 6a8d109..422d367 100644
  
  	.text
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index f709217..ddb1660 100644
+index f709217..c1e6aff 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -33,6 +33,16 @@
@@ -514,7 +514,29 @@ index f709217..ddb1660 100644
  #if __ARM_KERNEL_PROTECT__
  #include <arm/pmap.h>
  #endif /* __ARM_KERNEL_PROTECT__ */
-@@ -600,6 +610,29 @@ Linvalidate_bootstrap:							// do {
+@@ -101,7 +111,10 @@ LEXT(LowResetVectorBase)
+ 	// Preserve x0 for start_first_cpu, if called
+ 
+ 	// Unlock the core for debugging
++#if !defined(MSM8916_PORT)
++	/* msm8916 firmware can trap OSLAR_EL1 at EL1 to an unhandled EL2 */
+ 	msr		OSLAR_EL1, xzr
++#endif
+ 	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
+ 
+ #if !(defined(KERNEL_INTEGRITY_KTRR))
+@@ -450,7 +463,10 @@ start_cpu:
+ LEXT(start_first_cpu)
+ 
+ 	// Unlock the core for debugging
++#if !defined(MSM8916_PORT)
++	/* msm8916 firmware can trap OSLAR_EL1 at EL1 to an unhandled EL2 */
+ 	msr		OSLAR_EL1, xzr
++#endif
+ 	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
+ 	mov		x20, x0
+ 	mov		x21, #0
+@@ -600,6 +616,29 @@ Linvalidate_bootstrap:							// do {
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
@@ -544,7 +566,7 @@ index f709217..ddb1660 100644
  	/* Ensure TTEs are visible */
  	dsb		ish
  
-@@ -747,7 +780,7 @@ common_start:
+@@ -747,7 +786,7 @@ common_start:
  	mov		x0, #0
  	msr		TPIDR_EL1, x0						// Set thread register
  
@@ -553,7 +575,7 @@ index f709217..ddb1660 100644
  	// Initialization common to all Apple targets
  	ARM64_IS_PCORE x15
  	ARM64_READ_EP_SPR x15, x12, ARM64_REG_EHID4, ARM64_REG_HID4
-@@ -756,7 +789,7 @@ common_start:
+@@ -756,7 +795,7 @@ common_start:
  	ARM64_WRITE_EP_SPR x15, x12, ARM64_REG_EHID4, ARM64_REG_HID4
  #endif  // APPLE_ARM64_ARCH_FAMILY
  
