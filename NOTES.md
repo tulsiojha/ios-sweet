@@ -142,18 +142,28 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   stock LK ignores it too.** Bytes 176..191 as words: 38000000 00000000 00000001 00000000.
   Stock boot.img restored after the v8 test (fastboot flash boot + reboot, 2026-11-06);
   Android 5.1.1 is back online via adb.
-- **IRQ bring-up v9 (2026-11-06):** real vector table (IRQ at current-EL/SPx ->
-  irq_entry spilling x0-x18/x30; faults also report SPSR + decoded ESR) and GICv2 init
-  with a 1 ms CNTP tick. First hardware run: GICD/GICC_CTLR bit0 write+readback = 1,
-  PMR 0xF0, ISENABLER0 = 0x40000000 (PPI 30), `timer: tval=19200 ctl=1`, but **0 IRQs
-  in 150 s** (`irq: 0 ticks in 5000 ms` repeatedly) while the eMMC 8-bit HS + GPT scan
-  still passed. IGROUPR0 reads 0 and ignores a bit30 write. Observation: this matches a
-  Secure EL1 entry (QSEE elexec) with a GICv1-style secure view, not NS EL1 - at S-EL1
-  the CNTP timer raises **PPI 29** (secure physical timer), not 30. v10 enables PPI 29
-  and 30, logs which id fires plus GICD IIDR/TYPER and CNTP_CTL/HPPIR/RPR when idle
-  (`vivo-test10-boot.img` sha256 7aa0ed9d...8625, built, not yet flashed). Torn-down
-  next step after that: decide whether to keep running S-EL1 or drop to NS EL1 for the
-  kernel handoff.
+- **IRQ bring-up v9-v14 (2026-11-06): solved - a real 1 kHz tick runs at NS EL1.**
+  v9 added the vector table (IRQ at current-EL/SPx -> irq_entry spilling x0-x18/x30;
+  faults report SPSR + decoded ESR) and GICv2 init (GICD 0x0b000000, GICC 0x0b002000)
+  with a 1 ms CNTP tick. v9/v10 saw 0 IRQs with PPI 30 while CNTP_CTL read ISTATUS=1
+  and HPPIR 1023. The earlier note guessing "Secure EL1 entry" was wrong: the GICv2
+  spec non-secure view (ARE_NS=0) aliases GICD_CTLR bit0 to EnableGrp1 and makes bit1
+  RES0 - exactly our write-3/read-1 readback - so the payload is NS EL1, like the stock
+  kernel (same scm_elexec_call). v11 phase C + v12 (CNTV, 10 ms) ruled out the rest: a
+  foreign id 29 arrived every 5860 ms regardless of CNTP/CNTV state, and 27/30 never
+  delivered. v13 enabled every PPI/SGI (`isen0=ffff3fff`; 14/15 are reserved) and
+  self-sent SGI 0: delivery works (id 0=+1) and the 1 ms cadence appeared on **PPI 19**,
+  with PPI 20 firing exactly once (the single CNTV arm). msm8916's QGIC remaps the arch
+  timer PPIs to 17 hyp / 18 secure phys / 19 NS phys / 20 virt (per its kernel DT) -
+  the NS physical timer was never on the standard PPI 30. v14 isolated PPI 19 (enabled
+  only it, rearm from its handler): 14977 IRQs in 15 s = 998.5 Hz, d19=1 ms, hppir=3ff;
+  then CNTP off + no rearm -> 0 more IRQs for 45+ s (count frozen at 14977). USB console
+  and the eMMC 8-bit HS + GPT path stayed healthy at the ~1 kHz IRQ load in every run.
+  Images (device-info/vivo-stock, gitignored): v10 7aa0ed9d...8625, v11 ee644c88...388,
+  v12 94ffe03d...f29c, v13 feae9a67...5a1c, v14 059119ae...addef; commits 009557c
+  (v10), 0202aa9 (v11), f30742e (v12), 0c7cbec (v13), 9dd1e88 (v14). Open oddity,
+  irrelevant to the tick: PPI 29 mirrored PPI 19 1:1 at 1 kHz in v13 only, while the
+  handler happened to rearm CNTP from the 29 branch - cause unexplained.
 - **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
   iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
   xnu-8796 + iOS 12 userland vs port xnu-4903).
@@ -163,10 +173,9 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
 - **Next steps:** (1) restore the stock boot.img (needs fastboot); later consider 50 MHz
-  (GPLL0/8 + divider 1); (2) GICv2 + arch timer +
-  exception handling when IRQs are needed (until then IRQs stay masked and the GIC off);
-  (3) sweet-style payload pipeline (mkpayload) for this device; (4) msm8916 ADT generator;
-  (5) iOS 12 root image into userdata (destructive, confirm first).
+  (GPLL0/8 + divider 1); (2) sweet-style payload pipeline (mkpayload) for this device;
+  (3) msm8916 ADT generator; (4) iOS 12 root image into userdata (destructive, confirm
+  first); GICv2 + 1 kHz arch timer done (v14, PPI 19).
   BLSP1 UART2 stays a fallback (GCC clocks needed, pins probably not exposed). Reference
   for the SCM path: lk2nd `platform/msm_shared/scm.c` + `app/aboot/aboot.c` (cloned at
   /tmp/lk2nd, not in git).
