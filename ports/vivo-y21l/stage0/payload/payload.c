@@ -1,5 +1,5 @@
 /*
- * stage0 v7b AArch64 payload: polled ChipIdea USB device-mode console plus
+ * stage0 v8 AArch64 payload: polled ChipIdea USB device-mode console plus
  * an SDHCI eMMC block layer (8-bit/HS switch, multi-block reads, GPT scan).
  *
  * Runs at EL1 with the MMU and caches off, entered at 0x8000a000 by the
@@ -1265,10 +1265,19 @@ static u32 emmc_switch(u32 index, u32 value)
 	return 0x500 | st;
 }
 
+/* LBA0 read must come back with the 0xAA55 signature */
+static u32 emmc_verify(u8 *blk)
+{
+	u32 r = sdcc_read_block(0, blk);
+
+	return r || blk[510] != 0x55 || blk[511] != 0xaa;
+}
+
 /*
- * Read EXT_CSD (CMD8), try 8-bit bus + high speed, raise the clock to
- * 25 MHz and verify with a fresh LBA0 read. On failure fall back to
- * 1-bit SDR at 390 kHz and verify again.
+ * Read EXT_CSD (CMD8), try 8-bit bus + high speed like stock LK does
+ * (LK does not consult the card's BUS_WIDTH), raise the clock to 25 MHz
+ * and verify with a fresh LBA0 read. Unwind one step at a time on
+ * failure, verifying after each, down to 1-bit SDR at 390 kHz.
  */
 static u32 emmc_fast(u8 *blk)
 {
@@ -1284,41 +1293,41 @@ static u32 emmc_fast(u8 *blk)
 	}
 	widths = g_ext_csd[183];
 	dev_type = g_ext_csd[196] | (g_ext_csd[197] << 8);
-	log_printf("emmc: bus_w=%x dev_type=%x hs_timing=%x\n",
-		   widths, dev_type, g_ext_csd[185]);
+	log_printf("emmc: bus_w=%x dev_type=%x hs_timing=%x rev=%u\n",
+		   widths, dev_type, g_ext_csd[185], g_ext_csd[192]);
+	log_printf("emmc: ecsd[176..191]=%x %x %x %x\n",
+		   *(u32 *)(g_ext_csd + 176), *(u32 *)(g_ext_csd + 180),
+		   *(u32 *)(g_ext_csd + 184), *(u32 *)(g_ext_csd + 188));
+	log_printf("emmc: sec_count=%x\n", *(u32 *)(g_ext_csd + 212));
 	probe_drain();
 
-	if (widths & 4) {		/* bit2: 8-bit supported */
-		r = emmc_switch(183, 2);
-		log_printf("emmc: 8bit %u\n", r);
-		probe_drain();
-		if (!r) {
-			wr8(SDHCI_BASE + SDHCI_HOST_CTRL1,
-			    (u8)((rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) & ~2u) | 0x20u));
-			g_emmc_fast |= 1;
-		}
+	r = emmc_switch(183, 2);
+	log_printf("emmc: 8bit %u\n", r);
+	probe_drain();
+	if (!r) {
+		wr8(SDHCI_BASE + SDHCI_HOST_CTRL1,
+		    (u8)((rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) & ~2u) | 0x20u));
+		g_emmc_fast |= 1;
 	}
 
-	if (!r && (dev_type & 6)) {	/* any HS timing bit */
-		r = emmc_switch(185, 1);
-		log_printf("emmc: hs %u\n", r);
+	r = emmc_switch(185, 1);
+	log_printf("emmc: hs %u\n", r);
+	probe_drain();
+	if (!r) {
+		log_puts("emmc: raise clk\n");
 		probe_drain();
-		if (!r) {
-			log_puts("emmc: raise clk\n");
-			probe_drain();
-			wr8(SDHCI_BASE + SDHCI_HOST_CTRL1,
-			    (u8)(rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) | 4u));
-			sdcc_set_clock(1);
-			g_emmc_fast |= 4;
-			log_printf("emmc: clk ctl=%x host1=%x\n",
-				   rd16(SDHCI_BASE + SDHCI_CLK_CTRL),
-				   rd8(SDHCI_BASE + SDHCI_HOST_CTRL1));
-			probe_drain();
-		}
+		wr8(SDHCI_BASE + SDHCI_HOST_CTRL1,
+		    (u8)(rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) | 4u));
+		sdcc_set_clock(1);
+		g_emmc_fast |= 4;
+		log_printf("emmc: clk ctl=%x host1=%x\n",
+			   rd16(SDHCI_BASE + SDHCI_CLK_CTRL),
+			   rd8(SDHCI_BASE + SDHCI_HOST_CTRL1));
+		probe_drain();
 	}
 
-	r = sdcc_read_block(0, blk);
-	if (!r && blk[510] == 0x55 && blk[511] == 0xaa) {
+	r = emmc_verify(blk);
+	if (!r) {
 		log_printf("emmc: fast ok %x\n", g_emmc_fast);
 		probe_drain();
 		return 0;
@@ -1326,12 +1335,34 @@ static u32 emmc_fast(u8 *blk)
 	log_printf("emmc: fast verify failed %u\n", r);
 	probe_drain();
 
-	/* back to 1-bit SDR at 390 kHz */
-	sdcc_set_clock(64);
-	if (g_emmc_fast & 4)
-		emmc_switch(185, 0);
-	if (g_emmc_fast & 1)
+	if (g_emmc_fast & 1) {		/* step back to 1-bit, keep HS */
 		emmc_switch(183, 1);
+		wr8(SDHCI_BASE + SDHCI_HOST_CTRL1,
+		    (u8)(rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) & ~0x20u));
+		g_emmc_fast &= ~1u;
+		r = emmc_verify(blk);
+		if (!r) {
+			log_printf("emmc: 1bit ok %x\n", g_emmc_fast);
+			probe_drain();
+			return 0;
+		}
+	}
+
+	if (g_emmc_fast & 4) {		/* drop HS and the clock */
+		sdcc_set_clock(64);
+		emmc_switch(185, 0);
+		wr8(SDHCI_BASE + SDHCI_HOST_CTRL1,
+		    (u8)(rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) & ~4u));
+		g_emmc_fast &= ~4u;
+		r = emmc_verify(blk);
+		if (!r) {
+			log_printf("emmc: slow ok %x\n", g_emmc_fast);
+			probe_drain();
+			return 0;
+		}
+	}
+
+	sdcc_set_clock(64);
 	wr8(SDHCI_BASE + SDHCI_HOST_CTRL1,
 	    (u8)((rd8(SDHCI_BASE + SDHCI_HOST_CTRL1) & ~(0x22u)) | 0x10u));
 	g_emmc_fast = 0;
@@ -1622,7 +1653,7 @@ static void boot_replay(void)
 		return;
 	last = ticks();
 
-	log_printf("\n-- v7b dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
+	log_printf("\n-- v8 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
 		   g_boot_dtb, g_boot_dtb_ok ? "ok" : "bad",
 		   g_boot_midr, g_boot_cntfrq, g_tick_ms);
 	log_printf("-- wdt_en=%x usb=%s emmc=%s fast=%x\n", g_boot_wdt_en,
@@ -1836,7 +1867,7 @@ void kmain(u64 dtb)
 	__asm__ volatile("mrs %0, midr_el1" : "=r"(midr));
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
 
-	log_printf("\nios-sweet vivo Y21L stage0 v6: AArch64 payload\n");
+	log_printf("\nios-sweet vivo Y21L stage0 v8: AArch64 payload\n");
 	g_boot_dtb = dtb;
 	g_boot_cntfrq = cntfrq;
 	g_boot_midr = (u32)midr;

@@ -122,8 +122,22 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   adds: probe starts 20 s after attach, `probe_drain()` (30 ms of usb_poll/usb_pump) after
   every probe log line and before risky steps, extra `emmc: sw idx=val`, `emmc: ext_csd
   read`, `emmc: raise clk`, `emmc: multi N blk @ lba` markers; GPT scan runs only if the
-  post-switch verify read passed. Next: power-cycle (boot partition already holds v7b), arm
-  the console reader before boot, capture the full probe log; then fastboot + restore stock.
+  post-switch verify read passed.
+- **BLOCK LAYER VERIFIED (2026-11-06, stage0 v7b):** full probe log captured with the raw
+  reader. EXT_CSD read (CMD8) works: `bus_w=0 dev_type=1f57 hs_timing=0`. CMD6 185=1 (HS)
+  succeeds, clock raised to 25 MHz (CLK_CTRL 0x0107, HOST_CTRL1 0x14 = ADMA2 + HS enable),
+  fresh LBA0 verify passes (`fast ok 4`). 8-bit was skipped because EXT_CSD[183] reads 0x00
+  (odd for an SK hynix part; stock LK switches to 8-bit without consulting the card, so v8
+  attempts it unconditionally with verify/fallback, plus an EXT_CSD byte dump for sanity).
+  CMD23 + CMD18 multi-block read works: GPT entries at LBA2, n=36, esz=128, 9 blocks in one
+  transfer. Partition table (first LBA + block count): modem 0x8000+0x20000, sbl1
+  0x28012+0x400, rpm/tz/hyp/aboot ~0x400 each, boot 0x3ac60+0x20000, recovery
+  0x5ac60+0x20000, devinfo 0x9ac60+0x4000, system 0x9ec60+0x600000, cache 0x6a0000+0x4b000,
+  persist 0x6eb000+0x10000, misc/keystore/config/oem, userdata 0x72b000+0x15f3fdf
+  (~11.0 GB). Boot partition still holds v7b; stock restore pending. v8
+  (`vivo-test8-boot.img` sha256 d8d2f85a...32f5, built, NOT flashed) logs EXT_CSD rev /
+  SEC_COUNT / bytes 176..191, attempts the 8-bit switch unconditionally and unwinds one
+  step at a time (1-bit while keeping HS, then 1-bit SDR) with an LBA0 verify after each.
 - **Open decisions:** iOS 12 userland target (iPhone 6 / 6s / 5s 12.5.7, recommend
   iPhone7,2 D10AP 12.5.7 - 1 GB RAM like this device); kernel baseline (reuse repo
   xnu-8796 + iOS 12 userland vs port xnu-4903).
@@ -132,10 +146,9 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) capture the full v7b probe log (boot partition already holds v7b;
-  arm `tools/vivo-console-read.py` before power-on), check the EXT_CSD decode, the 8-bit
-  switch (fast=4 means only HS+25 MHz took), the verify read and the GPT list; then restore
-  the stock boot.img; (2) GICv2 + arch timer +
+- **Next steps:** (1) v8: dump EXT_CSD bytes 176..201 and SEC_COUNT, attempt the 8-bit
+  switch unconditionally (verify + fallback to 1-bit), then restore the stock boot.img;
+  later consider 50 MHz (GPLL0/8 + divider 1); (2) GICv2 + arch timer +
   exception handling when IRQs are needed (until then IRQs stay masked and the GIC off);
   (3) sweet-style payload pipeline (mkpayload) for this device; (4) msm8916 ADT generator;
   (5) iOS 12 root image into userdata (destructive, confirm first).
