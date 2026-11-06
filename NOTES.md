@@ -203,13 +203,17 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   BUILD/obj/DEVELOPMENT_ARM64_T7000/kernel.development.t7000 (10,192,464 B stripped,
   11,563,192 B unstripped; Mach-O arm64, entry 0xfffffff0070f90a0 in __TEXT_EXEC,
   __TEXT at 0xfffffff007004000). Full patch set saved as
-  `ports/vivo-y21l/xnu-4903-arm64-oss-build.patch` (12 files, `git apply` on 494ffe1):
+  `ports/vivo-y21l/xnu-4903-arm64-oss-build.patch` (13 files, `git apply` on 494ffe1):
   (1) python3 - bsd/kern/makekdebugevents.py rewritten for py3 (it had py2 print
   statements and mixed tabs/spaces that raise TabError under py3; a clean tree always
   regenerates kdebugevents.h, so an incremental build can hide this), py3 rewrite of
-  tools/lldbmacros/core/syntax_checker.py, and `PYTHON ?= python3`
+  tools/lldbmacros/core/syntax_checker.py (builtin compile() instead of py_compile with
+  cfile=/dev/null, which Python 3.13 rejects with FileExistsError), `PYTHON ?= python3`
   in makedefs/MakeInc.cmd (it was empty, so the INSTALLPYTHON rule ran the scripts via
-  their `#!/usr/bin/env python` shebang);
+  their `#!/usr/bin/env python` shebang), and `BUILD_LLDBMACROS ?= NO` in
+  tools/lldbmacros/Makefile - the lldbmacros debugger helpers are py2 and a CLEAN tree's
+  config_all installs them through the py3 syntax check, so without the opt-out `make
+  all` exits 2 after the kernel has linked (this killed CI run 42225474987);
   (2) create BUILD/obj/EXPORT_HDRS/libsa and stage/usr/local/include/kernel (empty,
   satisfy -Wmissing-include-dirs);
   (3) `options MONOTONIC` in config/MASTER.arm64 (machine/monotonic.h uses MT_CORE_NFIXED
@@ -234,17 +238,29 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   stage0's loader already maps by payload virt_base and passes virtBase/physBase
   0x88000000 in boot_args, and xnu then computes
   vm_kernel_slide = segTEXTB - VM_KERNEL_LINK_ADDRESS = 0. Not yet boot-tested.
+  CI: `.github/workflows/xnu-4903.yml` (commit 8eedd8f) applies the patch to a fresh
+  494ffe1 clone and builds on `macos-15-intel`. `macos-14` now resolves to
+  `macos-14-arm64-us-default`, a configuration this repo cannot use ("The configuration
+  ... is not supported", run dies before step 1); runs 42225191420/42225233484/
+  42225368145 died that way. Run 42225474987 (8eedd8f) built and packaged the kernel
+  (artifact xnu-4903-kernel 8.43 MB) but exited 2 at lldbmacros, same as the local clean
+  tree; fix above, local `make all` rerun EXIT=0 with no INSTALLPY attempts. The Build
+  step now tees `build.log` and the artifact includes it (unauth users cannot read job
+  logs; artifact logs are the only way to see failures). CI auth: origin dipa-studio is
+  HTTPS and this Mac has no credential, SSH authenticates as tulsiojha (no write on
+  dipa-studio), so pushes go to the `fork` remote
+  git@github.com:tulsiojha/ios-sweet.git; origin/dipa-studio/main stays at 45263be
+  until the user merges.
 - **Port deltas vs sweet:** 32-bit stage0 (real one) must switch AArch32 EL2 -> AArch64
   (lk2nd-style HCR.RW + eret) and then jump to the AArch64 payload; SDHCI eMMC driver,
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
   (bootloader splash stays on screen), RMI4 I2C + PM8916 PON input, ChipIdea device-mode
   USB for logs, msm8916 ADT generator, iOS 12 root image in userdata.
-- **Next steps:** (1) add a repo CI workflow that applies
-  ports/vivo-y21l/xnu-4903-arm64-oss-build.patch and uploads the kernel (xnu-4903 links
-  locally as of 2026-11-06; the pinned blacktop path cannot build 10.14-era xnu);
-  (2) mkpayload.py LC_DYLD_INFO rebase support is done (commit 839585a); the current
-  build has no rebases at all, so plug the kernel Mach-O into mkpayload.sh / the v15
-  flash recipe and boot-test (temporary `fastboot flash boot`, confirm with user);
+- **Next steps:** (1) get the xnu-4903 CI run green on the lldbmacros fix and compare
+  its kernel artifact with the local build; (2) mkpayload.py LC_DYLD_INFO rebase support
+  is done (commit 839585a); the current build has no rebases at all, so plug the kernel
+  Mach-O into mkpayload.sh / the v15 flash recipe and boot-test (temporary `fastboot
+  flash boot`, confirm with user);
   (3) implement GICv2 + arch timer (PPI 19) behind ml_irq/IOCPU plus an FDT platform
   expert for our ADT (AIC will not be used); (4) take
   ADT shapes from a real D10AP/iOS 12 device tree (Apple artifact, keep out of git);

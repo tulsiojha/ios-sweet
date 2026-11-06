@@ -39,18 +39,20 @@ jobs:
       - name: Build kernel
         working-directory: xnu-4903
         run: |
+          # tee the log so a failed build can be inspected from the artifact
           make ARCH_CONFIGS=ARM64 KERNEL_CONFIGS=DEVELOPMENT \
             MACHINE_CONFIGS=T7000 SDKROOT=macosx \
             ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 \
             INCFLAGS_SDK="-I$PWD/stage/usr/local/include/kernel" \
             BUILD_WERROR=0 CTFCONVERT=/usr/bin/true CTFMERGE=/usr/bin/true \
-            -j"$(sysctl -n hw.ncpu)" -k
+            -j"$(sysctl -n hw.ncpu)" -k 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
       - name: Package
         if: always()
         run: |
           dir=xnu-4903/BUILD/obj/DEVELOPMENT_ARM64_T7000
           mkdir -p out
+          cp build.log out/ 2>/dev/null || true
           find "$dir" -maxdepth 1 -name 'kernel.*' ! -name '*.dSYM' -exec cp {} out/ \; 2>/dev/null || true
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) 2>/dev/null || true
           ls -la out
@@ -71,5 +73,6 @@ jobs:
             out/kernel.*
             out/SHA256SUMS
             out/payload.bin
+            out/build.log
           if-no-files-found: warn
           retention-days: 7

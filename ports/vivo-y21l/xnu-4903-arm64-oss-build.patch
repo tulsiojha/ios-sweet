@@ -360,8 +360,25 @@ index d296cb6..d9d5953 100644
  
  ${SOBJS}: assym.s
  
+diff --git a/tools/lldbmacros/Makefile b/tools/lldbmacros/Makefile
+index aec946f..db127ca 100644
+--- a/tools/lldbmacros/Makefile
++++ b/tools/lldbmacros/Makefile
+@@ -8,7 +8,12 @@ include $(MakeInc_def)
+ 
+ .PHONY: lldbmacros_install
+ 
++# The lldbmacros debugger helpers are Python 2 and fail the Python 3 syntax
++# check; skip installing them unless explicitly requested.
++BUILD_LLDBMACROS ?= NO
++ifeq ($(BUILD_LLDBMACROS),YES)
+ do_config_all:: lldbmacros_install
++endif
+ 
+ LLDBMACROS_SOURCE:=$(SRCROOT)/tools/lldbmacros/
+ LLDBMACROS_BOOTSTRAP_DEST:=$(OBJPATH)/$(KERNEL_FILE_NAME).dSYM/$(DSYMLLDBMACROSDIR)
 diff --git a/tools/lldbmacros/core/syntax_checker.py b/tools/lldbmacros/core/syntax_checker.py
-index 02ec68e..2a02211 100755
+index 02ec68e..0c22a78 100755
 --- a/tools/lldbmacros/core/syntax_checker.py
 +++ b/tools/lldbmacros/core/syntax_checker.py
 @@ -1,4 +1,4 @@
@@ -370,16 +387,20 @@ index 02ec68e..2a02211 100755
  
  helpdoc = """
  A simple utility that verifies the syntax for python scripts.
-@@ -6,7 +6,7 @@ The checks it does are :
+@@ -6,26 +6,25 @@ The checks it does are :
    * Check for 'tab' characters in .py files
    * Compile errors in py sources
  Usage:
 -  python syntax_checker.py <python_source_file> [<python_source_file> ..] 
 +  python3 syntax_checker.py <python_source_file> [<python_source_file> ..] 
  """
- import py_compile
+-import py_compile
  import sys
-@@ -17,15 +17,15 @@ tabs_search_rex = re.compile("^\s*\t+",re.MULTILINE|re.DOTALL)
+ import os
+ import re
+ 
+-tabs_search_rex = re.compile("^\s*\t+",re.MULTILINE|re.DOTALL)
++tabs_search_rex = re.compile(r"^\s*\t+",re.MULTILINE|re.DOTALL)
  
  if __name__ == "__main__":
      if len(sys.argv) < 2:
@@ -399,7 +420,7 @@ index 02ec68e..2a02211 100755
              continue
          fh = open(fname)
          strdata = fh.readlines()
-@@ -34,18 +34,17 @@ if __name__ == "__main__":
+@@ -34,18 +33,18 @@ if __name__ == "__main__":
          for linedata in strdata:
              lineno += 1
              if len(tabs_search_rex.findall(linedata)) > 0 :
@@ -410,12 +431,16 @@ index 02ec68e..2a02211 100755
 -            print >>sys.stderr, "Error: Syntax check failed. Please fix the errors and try again."
 +            print("Error: Syntax check failed. Please fix the errors and try again.", file=sys.stderr)
              sys.exit(1)
-         #now check for error in compilation
+-        #now check for error in compilation
++        #now check for error in compilation (compile() avoids writing .pyc files;
++        #py_compile with cfile=/dev/null raises FileExistsError on modern Python)
          try:
-             compile_result = py_compile.compile(fname, cfile="/dev/null", doraise=True)
-         except py_compile.PyCompileError as exc:
+-            compile_result = py_compile.compile(fname, cfile="/dev/null", doraise=True)
+-        except py_compile.PyCompileError as exc:
 -            print >>sys.stderr, str(exc)
 -            print >>sys.stderr, "Error: Compilation failed. Please fix the errors and try again."
++            compile("".join(strdata), fname, "exec")
++        except SyntaxError as exc:
 +            print(str(exc), file=sys.stderr)
 +            print("Error: Compilation failed. Please fix the errors and try again.", file=sys.stderr)
              sys.exit(1)
