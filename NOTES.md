@@ -238,6 +238,18 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   stage0's loader already maps by payload virt_base and passes virtBase/physBase
   0x88000000 in boot_args, and xnu then computes
   vm_kernel_slide = segTEXTB - VM_KERNEL_LINK_ADDRESS = 0. Not yet boot-tested.
+- **xnu-4903 boot image built, not flashed (2026-11-06):** the 10,199,328-byte
+  SWEETXNU payload does not fit the stock 3,678,553-byte ramdisk slot, so
+  tools/vivo-repack-boot.py gained `--grow-ramdisk` (raise ramdisk_size in the boot
+  header, move the QCDT + trailing PKCS#7 bytes after the blob; verified QCDT/tail
+  byte-identical) and mkpayload.sh passes it. Image
+  `ports/vivo-y21l/out/vivo-boot-xnu4903.img`, 29,138,154 B (0x1BC9CEA): kernel slot =
+  stage0v5 (39,824 B), ramdisk_size 0x9BA800, QCDT 0xA46000 moved 0xB4B800 ->
+  0x1183800, sha256 55bbf1c4...d4b8. Hashes vary per build because mkadt's
+  random-seed is os.urandom(64). FLASH BLOCKER: the phone is not attached (no adb,
+  no fastboot device); boot partition must be >= 29,138,154 B, check with
+  `fastboot getvar partition-size:boot` (unknown whether this LK supports it; a
+  too-large image is refused at flash time, which is safe).
   CI: `.github/workflows/xnu-4903.yml` (commit 8eedd8f) applies the patch to a fresh
   494ffe1 clone and builds on `macos-15-intel`. `macos-14` now resolves to
   `macos-14-arm64-us-default`, a configuration this repo cannot use ("The configuration

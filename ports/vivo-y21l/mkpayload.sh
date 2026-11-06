@@ -30,4 +30,4 @@ python3 "$ROOT/tools/mkpayload.py" "$kernel" out/vivo.adt out/payload.bin \
 python3 "$ROOT/tools/vivo-repack-boot.py" \
 	"$ROOT/device-info/vivo-stock/boot.img" \
 	"$ROOT/ports/vivo-y21l/stage0/out/stage0v5.bin" \
-	"${2:-out/vivo-boot.img}" --ramdisk-blob out/payload.bin
+	"${2:-out/vivo-boot.img}" --ramdisk-blob out/payload.bin --grow-ramdisk
