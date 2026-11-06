@@ -141,8 +141,8 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   HS_TIMING=0 before the switch; BUS_WIDTH still reads 0x00 - bogus on this hynix part,
   stock LK ignores it too.** Bytes 176..191 as words: 38000000 00000000 00000001 00000000.
   Stock boot.img restored after the v8 test (fastboot flash boot + reboot, 2026-11-06),
-  and again after the v14 IRQ test (2026-11-06); Android 5.1.1 back online via adb both
-  times.
+  again after the v14 IRQ test, and again after the v15 payload test (2026-11-06);
+  Android 5.1.1 back online via adb each time.
 - **IRQ bring-up v9-v14 (2026-11-06): solved - a real 1 kHz tick runs at NS EL1.**
   v9 added the vector table (IRQ at current-EL/SPx -> irq_entry spilling x0-x18/x30;
   faults report SPSR + decoded ESR) and GICv2 init (GICD 0x0b000000, GICC 0x0b002000)
