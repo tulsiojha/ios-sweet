@@ -1,5 +1,5 @@
 /*
- * stage0 v12 AArch64 payload: polled ChipIdea USB device-mode console plus
+ * stage0 v13 AArch64 payload: polled ChipIdea USB device-mode console plus
  * an SDHCI eMMC block layer (8-bit/HS switch, multi-block reads, GPT scan).
  *
  * Runs at EL1 with the MMU and caches off, entered at 0x8000a000 by the
@@ -24,15 +24,16 @@
  * the GPT entry array with CMD23 + a multi-block CMD18, listing the
  * named partitions.
  *
- * v9/v10 turn the GICv2 on: distributor 0x0b000000 / CPU interface
- * 0x0b002000, CNTP tick, IRQs unmasked only after the GIC is configured.
- * v9 enabled PPI 30 (non-secure physical timer) and got nothing; v10
- * enabled 29+30 and PPI 29 fired about once per 5 s. v11 showed the
- * rearm write lands (CTL=1, TVAL readback ~1 ms) yet the rate does not
- * follow TVAL, and interrupts continue with CNTP masked - PPI 29 at
- * S-EL1 is QSEE's secure timer, not ours. v12 switches the tick to the
- * virtual timer (PPI 27, CNTV) and counts 27/29/30 separately plus the
- * PPI 29 event gap. USB and SDCC stay polled. Fault vectors decode ESR.
+ * v9..v12 turn the GICv2 on: distributor 0x0b000000 / CPU interface
+ * 0x0b002000, IRQs unmasked only after the GIC is configured. PPI 30
+ * (NS physical timer) never arrived while CNTP_CTL showed ISTATUS=1 and
+ * HPPIR 1023; CNTV/PPI 27 likewise never arrived; a foreign interrupt
+ * shows up as id 29 every 5860 ms regardless of our timer state. The
+ * GICD_CTLR readback (write 3 -> read 1 with ARE_NS=0) proves the
+ * Non-secure view from the GICv2 spec, so the payload is NS EL1. v13
+ * enables all 32 PPI/SGI ids, sends SGI 0 to self as a delivery
+ * self-test and counts every id to find which line the timers actually
+ * use. USB and SDCC stay polled. Fault vectors decode ESR.
  */
 
 #include <stdarg.h>
@@ -871,14 +872,15 @@ static void gic_disable_and_log(void)
 #define PPI_PHYS 30		/* non-secure physical timer */
 
 static volatile u32 g_irq_count, g_irq_other, g_irq_spurious;
-static volatile u32 g_irq_27, g_irq_29, g_irq_30;
-static volatile u32 g_d29, g_t29;	/* ticks between PPI 29 events */
+static volatile u32 g_id_cnt[32];	/* arrivals per PPI/SGI id */
+static volatile u32 g_d29, g_t29;	/* ticks between id 29 events */
 static u32 g_tval;
 
 /*
- * Called from irq_entry (entry.S), DAIF.I masked. The virtual timer
- * (PPI 27) is the tick source; CNTP stays armed only so a level from
- * the secure bank cannot storm. Unknown sources get disabled.
+ * Called from irq_entry (entry.S), DAIF.I masked. All 32 PPI/SGI ids are
+ * enabled so whichever line the timer is actually wired to shows up;
+ * id 29 gets its CNTP line rearmed (it is the level source seen so far),
+ * everything else is only counted. SPIs are never enabled.
  */
 void irq_handler(void)
 {
@@ -889,20 +891,16 @@ void irq_handler(void)
 		g_irq_spurious++;
 		return;
 	}
-	if (id == PPI_VIRT) {
-		__asm__ volatile("msr cntv_tval_el0, %0" :: "r"((u64)g_tval));
-		g_irq_27++;
-		g_irq_count++;
-	} else if (id == PPI_SEC) {
-		u32 now = ticks();
+	if (id < 32) {
+		if (id == PPI_SEC) {
+			u32 now = ticks();
 
-		__asm__ volatile("msr cntp_tval_el0, %0" :: "r"((u64)g_tval));
-		g_d29 = now - g_t29;
-		g_t29 = now;
-		g_irq_29++;
-		g_irq_count++;
-	} else if (id == PPI_PHYS) {
-		g_irq_30++;
+			__asm__ volatile("msr cntp_tval_el0, %0" ::
+					 "r"((u64)g_tval));
+			g_d29 = now - g_t29;
+			g_t29 = now;
+		}
+		g_id_cnt[id]++;
 		g_irq_count++;
 	} else {
 		g_irq_other++;
@@ -929,9 +927,8 @@ static void gic_irq_start(void)
 	grp0 = rd(GICD_BASE + 0x080);
 	wr(GICD_BASE + 0x080, 0xffffffff);
 	grp1 = rd(GICD_BASE + 0x080);
-	wr(GICD_BASE + 0x100,
-	   (1u << PPI_VIRT) | (1u << PPI_SEC) | (1u << PPI_PHYS));
-	wr(GICD_BASE, 3);		/* group0|group1 enable, or GICv1 bit0 */
+	wr(GICD_BASE + 0x100, 0xffffffff);	/* every PPI and SGI */
+	wr(GICD_BASE, 3);		/* NS view: bit0 = EnableGrp1 */
 	wr(GICC_BASE + 0x04, 0xf0);	/* priority mask */
 	wr(GICC_BASE, 3);
 	barrier();
@@ -951,8 +948,12 @@ static void gic_irq_start(void)
 		   grp0, grp1, rd(GICD_BASE + 0x100));
 	log_printf("gic: iidr=%x typer=%x\n", rd(GICD_BASE + 0x08),
 		   rd(GICD_BASE + 0x04));
-	log_printf("timer: virt=%u tval=%u vctl=%lx pctl=%lx cnt=%x\n",
-		   PPI_VIRT, g_tval, vctl, pctl, ticks());
+	log_printf("timer: tval=%u vctl=%lx pctl=%lx cnt=%x\n", g_tval,
+		   vctl, pctl, ticks());
+
+	/* SGI 0 to self: proves the distributor->CPU-interface path */
+	wr(GICD_BASE + 0xf00, (2u << 24) | 0u);
+	log_puts("gic: self SGI 0 sent\n");
 
 	__asm__ volatile("msr daifclr, #2" ::: "memory");
 	log_puts("irq: unmasked\n");
@@ -960,8 +961,10 @@ static void gic_irq_start(void)
 
 static void irq_watch(void)
 {
-	static u32 t0, c27, c29, c30, w;
-	u32 ms, d29ms;
+	static u32 t0, c[32];
+	static u32 c_other, c_spur;
+	u64 ctl;
+	u32 i, n;
 
 	if (!g_tval)
 		return;
@@ -971,13 +974,26 @@ static void irq_watch(void)
 	}
 	if (elapsed_ms(t0) < 5000)
 		return;
-	d29ms = g_d29 / (u32)(g_boot_cntfrq / 1000);
-	log_printf("irq%d: 27=+%u 29=+%u (gap %ums) 30=+%u oth=%u spur=%u\n",
-		   w++, g_irq_27 - c27, g_irq_29 - c29, d29ms,
-		   g_irq_30 - c30, g_irq_other, g_irq_spurious);
-	c27 = g_irq_27;
-	c29 = g_irq_29;
-	c30 = g_irq_30;
+	__asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(ctl));
+	log_puts("ppi:");
+	n = 0;
+	for (i = 0; i < 32; i++) {
+		u32 v = g_id_cnt[i];
+
+		if (v != c[i]) {
+			log_printf(" %u=+%u", i, v - c[i]);
+			c[i] = v;
+			n++;
+		}
+	}
+	if (!n)
+		log_puts(" none");
+	log_printf(" oth=+%u spur=+%u d29=%ums ctl=%lx hppir=%x\n",
+		   g_irq_other - c_other, g_irq_spurious - c_spur,
+		   g_d29 / (u32)(g_boot_cntfrq / 1000), ctl,
+		   rd(GICC_BASE + 0x18));
+	c_other = g_irq_other;
+	c_spur = g_irq_spurious;
 	t0 = ticks();
 }
 
@@ -1782,7 +1798,7 @@ static void boot_replay(void)
 		return;
 	last = ticks();
 
-	log_printf("\n-- v12 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
+	log_printf("\n-- v13 dtb=%lx %s midr=%x cntfrq=%lx tick_ms=%u\n",
 		   g_boot_dtb, g_boot_dtb_ok ? "ok" : "bad",
 		   g_boot_midr, g_boot_cntfrq, g_tick_ms);
 	log_printf("-- wdt_en=%x usb=%s emmc=%s fast=%x irq=%u\n", g_boot_wdt_en,
@@ -1999,7 +2015,7 @@ void kmain(u64 dtb)
 	__asm__ volatile("mrs %0, midr_el1" : "=r"(midr));
 	__asm__ volatile("mrs %0, cntfrq_el0" : "=r"(cntfrq));
 
-	log_printf("\nios-sweet vivo Y21L stage0 v12: AArch64 payload\n");
+	log_printf("\nios-sweet vivo Y21L stage0 v13: AArch64 payload\n");
 	g_boot_dtb = dtb;
 	g_boot_cntfrq = cntfrq;
 	g_boot_midr = (u32)midr;
