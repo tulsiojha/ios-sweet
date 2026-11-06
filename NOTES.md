@@ -204,8 +204,10 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   11,563,192 B unstripped; Mach-O arm64, entry 0xfffffff0070f90a0 in __TEXT_EXEC,
   __TEXT at 0xfffffff007004000). Full patch set saved as
   `ports/vivo-y21l/xnu-4903-arm64-oss-build.patch` (12 files, `git apply` on 494ffe1):
-  (1) python3 - shebangs in bsd/kern/makekdebugevents.py and
-  tools/lldbmacros/core/syntax_checker.py (rewritten for py3), and `PYTHON ?= python3`
+  (1) python3 - bsd/kern/makekdebugevents.py rewritten for py3 (it had py2 print
+  statements and mixed tabs/spaces that raise TabError under py3; a clean tree always
+  regenerates kdebugevents.h, so an incremental build can hide this), py3 rewrite of
+  tools/lldbmacros/core/syntax_checker.py, and `PYTHON ?= python3`
   in makedefs/MakeInc.cmd (it was empty, so the INSTALLPYTHON rule ran the scripts via
   their `#!/usr/bin/env python` shebang);
   (2) create BUILD/obj/EXPORT_HDRS/libsa and stage/usr/local/include/kernel (empty,
