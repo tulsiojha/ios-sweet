@@ -277,10 +277,13 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   `out/vivo-boot-shmcon.img` (sha256 e7c356b9...d744, loader armed the APCS WDT at
   0x0b017000 with bark 196608 / bite 327680 = 6 s/10 s at 32 kHz). RESULT: the stage0
   USB console never enumerated (no tty.usbmodem across four 38 s cycles) and the
-  phone ended BLACK/POWERED OFF - the WDT bite powers the PMIC down instead of
-  resetting the SoC, so there is no reset to exploit. OBSERVATION: do not arm the WDT
-  again. Stock boot.img restored again (fastboot, 51042586...35b1). loader.c's
-  wdt_arm_reset() is removed; dump_prev_shmcon() stays (it only reads and costs
+  phone ended BLACK/POWERED OFF. GUESS (unverified): the WDT bite powers the PMIC down
+  instead of resetting the SoC, so there was no reset to exploit; the user suggests the
+  battery may simply have been low, which fits the same observation. Either way the
+  phone was not reset-looping, so this test proved nothing about the WDT's reset
+  behavior. wdt_arm_reset() is removed from loader.c for now - if the reset-and-dump
+  path is wanted later, retest on a fully charged phone. Stock boot.img restored
+  again (fastboot, 51042586...35b1). dump_prev_shmcon() stays (it only reads and costs
   nothing, useful if DRAM ever survives a warm reset). DECISION: live console must
   come from xnu itself -> pexpert/arm/pe_serial.c now has a `usbcon` backend: polled
   ChipIdea device controller (same USB_BASE 0x078d9000, ULPI/clock bring-up,
