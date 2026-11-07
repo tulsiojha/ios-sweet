@@ -761,6 +761,130 @@ index d296cb6..d9d5953 100644
  
  ${SOBJS}: assym.s
  
+diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
+index 4328c7f..ff24d8d 100644
+--- a/pexpert/arm/pe_identify_machine.c
++++ b/pexpert/arm/pe_identify_machine.c
+@@ -21,6 +21,14 @@
+ /* Local declarations */
+ void            pe_identify_machine(boot_args * bootArgs);
+ 
++#if defined(MSM8916_PORT)
++/* Early msm8916 ring console (pe_serial.c), usable before the VM exists. */
++extern void usbcon_early_puts(const char *s);
++#define IDENT_PROBE(s) usbcon_early_puts(s)
++#else
++#define IDENT_PROBE(s) do { } while (0)
++#endif
++
+ /* External declarations */
+ extern void clean_mmu_dcache(void);
+ 
+@@ -52,7 +60,10 @@ pe_identify_machine(boot_args * bootArgs)
+ 
+ 	(void)bootArgs;
+ 
++	IDENT_PROBE("xnu> ident enter\r\n");
++
+ 	if (pe_arm_get_soc_base_phys() == 0) {
++		IDENT_PROBE("xnu> ident no-soc\r\n");
+ 		return;
+ 	}
+ 
+@@ -233,6 +244,8 @@ pe_identify_machine(boot_args * bootArgs)
+ 	gPEClockFrequencyInfo.bus_to_dec_rate_num = 1;
+ 	gPEClockFrequencyInfo.bus_to_dec_rate_den =
+ 	    gPEClockFrequencyInfo.bus_clock_rate_hz / gPEClockFrequencyInfo.dec_clock_rate_hz;
++
++	IDENT_PROBE("xnu> ident done\r\n");
+ }
+ 
+ vm_offset_t
+@@ -243,6 +256,8 @@ pe_arm_get_soc_base_phys(void)
+ 	uint32_t        prop_size;
+ 	char           *tmpStr;
+ 
++	IDENT_PROBE("xnu> soc enter\r\n");
++
+ 	if (DTFindEntry("name", "arm-io", &entryP) == kSuccess) {
+ 		if (gPESoCDeviceType == 0) {
+ 			DTGetProperty(entryP, "device_type", (void **)&tmpStr, &prop_size);
+@@ -252,8 +267,10 @@ pe_arm_get_soc_base_phys(void)
+ 			DTGetProperty(entryP, "ranges", (void **)&ranges_prop, &prop_size);
+ 			gPESoCBasePhys = *(ranges_prop + 1);
+ 		}
++		IDENT_PROBE("xnu> soc found\r\n");
+ 		return gPESoCBasePhys;
+ 	}
++	IDENT_PROBE("xnu> soc none\r\n");
+ 	return 0;
+ }
+ 
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+index 1113d5a..5b104de 100644
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -24,6 +24,14 @@
+ #endif
+ 
+ 
++#if defined(MSM8916_PORT)
++/* Early msm8916 ring console (pe_serial.c), usable before the VM exists. */
++extern void usbcon_early_puts(const char *s);
++#define PE_EARLY_PROBE(s) usbcon_early_puts(s)
++#else
++#define PE_EARLY_PROBE(s) do { } while (0)
++#endif
++
+ /* extern references */
+ extern void     pe_identify_machine(boot_args *bootArgs);
+ 
+@@ -320,6 +328,8 @@ PE_init_platform(boolean_t vm_initialized, void *args)
+ 	void          **prop;
+ 	boot_args      *boot_args_ptr = (boot_args *) args;
+ 
++	PE_EARLY_PROBE("xnu> pe enter\r\n");
++
+ 	if (PE_state.initialized == FALSE) {
+ 		PE_state.initialized = TRUE;
+ 		PE_state.bootArgs = boot_args_ptr;
+@@ -341,7 +351,9 @@ PE_init_platform(boolean_t vm_initialized, void *args)
+ 		 * can be used..
+ 		 */
+ 		DTInit(PE_state.deviceTreeHead);
++		PE_EARLY_PROBE("xnu> pe dtinit\r\n");
+ 		pe_identify_machine(boot_args_ptr);
++		PE_EARLY_PROBE("xnu> pe identify done\r\n");
+ 	} else {
+ 		pe_arm_init_interrupts(args);
+ 		pe_arm_init_debug(args);
+@@ -358,6 +370,7 @@ PE_init_platform(boolean_t vm_initialized, void *args)
+ 				gTargetTypeBuffer[size - 1] = '\0';
+ 			}
+ 		}
++		PE_EARLY_PROBE("xnu> pe target\r\n");
+ 		if (kSuccess == (DTFindEntry("name", "device-tree", &entry))) {
+ 			if (kSuccess == DTGetProperty(entry, "model",
+ 			    (void **)&prop, &size)) {
+@@ -368,6 +381,7 @@ PE_init_platform(boolean_t vm_initialized, void *args)
+ 				gModelTypeBuffer[size - 1] = '\0';
+ 			}
+ 		}
++		PE_EARLY_PROBE("xnu> pe model\r\n");
+ 		if (kSuccess == DTLookupEntry(NULL, "/chosen", &entry)) {
+ 			if (kSuccess == DTGetProperty(entry, "debug-enabled",
+ 			    (void **) &prop, &size)) {
+@@ -409,8 +423,10 @@ PE_init_platform(boolean_t vm_initialized, void *args)
+ 				bcopy(prop, &gPlatformMemoryID, size);
+ 			}
+ 		}
++		PE_EARLY_PROBE("xnu> pe chosen\r\n");
+ 		pe_init_debug();
+ 	}
++	PE_EARLY_PROBE("xnu> pe done\r\n");
+ }
+ 
+ void
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 index 3e70e3f..e763a22 100644
 --- a/pexpert/arm/pe_serial.c
@@ -1818,6 +1942,65 @@ index 3e70e3f..e763a22 100644
  #ifdef SHMCON
  	jconmode = 0;
  	if (PE_parse_boot_argn("jcon", &jconmode, sizeof jconmode)) {
+diff --git a/pexpert/gen/pe_gen.c b/pexpert/gen/pe_gen.c
+index b96bf49..bb0757f 100644
+--- a/pexpert/gen/pe_gen.c
++++ b/pexpert/gen/pe_gen.c
+@@ -40,6 +40,13 @@
+ 
+ static int DEBUGFlag;
+ 
++#if defined(MSM8916_PORT)
++extern void usbcon_early_puts(const char *s);
++#define DBG_PROBE(s) usbcon_early_puts(s)
++#else
++#define DBG_PROBE(s) do { } while (0)
++#endif
++
+ #if CONFIG_EMBEDDED
+ SECURITY_READ_ONLY_LATE(static uint32_t) gPEKernelConfigurationBitmask;
+ #else
+@@ -55,10 +62,14 @@ pe_init_debug(void)
+ {
+ 	boolean_t boot_arg_value;
+ 
++	DBG_PROBE("xnu> dbg enter\r\n");
++
+ 	if (!PE_parse_boot_argn("debug", &DEBUGFlag, sizeof(DEBUGFlag))) {
+ 		DEBUGFlag = 0;
+ 	}
+ 
++	DBG_PROBE("xnu> dbg debug\r\n");
++
+ 	gPEKernelConfigurationBitmask = 0;
+ 
+ 	if (!PE_parse_boot_argn("assertions", &boot_arg_value, sizeof(boot_arg_value))) {
+@@ -79,6 +90,8 @@ pe_init_debug(void)
+ 	}
+ 	gPEKernelConfigurationBitmask |= (boot_arg_value ? kPEICanHasStatistics : 0);
+ 
++	DBG_PROBE("xnu> dbg stats\r\n");
++
+ #if SECURE_KERNEL
+ 	boot_arg_value = FALSE;
+ #else
+@@ -90,6 +103,7 @@ pe_init_debug(void)
+ #endif
+ 	gPEKernelConfigurationBitmask |= (boot_arg_value ? kPEICanHasDiagnosticAPI : 0);
+ 
++	DBG_PROBE("xnu> dbg api\r\n");
+ 
+ 	int factor = 1;
+ 	boolean_t have_bootarg = PE_parse_boot_argn("cpu-factor", &factor, sizeof(factor));
+@@ -105,6 +119,8 @@ pe_init_debug(void)
+ 			}
+ 		}
+ 	}
++
++	DBG_PROBE("xnu> dbg done\r\n");
+ }
+ 
+ void
 diff --git a/tools/lldbmacros/Makefile b/tools/lldbmacros/Makefile
 index aec946f..db127ca 100644
 --- a/tools/lldbmacros/Makefile

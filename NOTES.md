@@ -635,12 +635,58 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   Patch regenerated: 1908 lines / 17 files, `git apply --check` clean on a
   fresh 494ffe1. Local kernel build EXIT=0; disassembly verified (and,
   milestones and tlbi all present).
-  NEXT: power-cycle the phone into fastboot, then
-  `python3 tools/vivo-console-watch.py -t /tmp/v25.timeline -o /tmp/v25.log 300`,
-  `fastboot flash boot ports/vivo-y21l/out/vivo-boot-pramfix.img`,
-  `fastboot reboot`. The first loader line reports the previous (v24) run
-  (`ms=0`); the v25 run's `ms`/ring appears on the FOLLOWING stage0 boot
-  (automatic if the 3.77 s reset returns, otherwise power-cycle once).
+- **v25 TEST (2026-11-07 09:58-10:02): THE PRAM BUG IS FIXED - the kernel
+  now reaches arm_init and the persistent ring works, then dies inside
+  PE_init_platform.** Flashed `out/vivo-boot-pramfix.img` at 09:58 (phone
+  was already in fastboot) and watched 300 s. The first loader line
+  reported the v24 run (`ms=ffffffffffffffff`, i.e. the word was never
+  written by v24, and `start=89165a5a...`). After the first v25 run, every
+  following stage0 boot (the phone now auto-resets and retries by itself,
+  ~13-14 s after the jump) printed:
+      prev: dram kept (4d4152444b524150) start=89165a5a5a5a5a5a ms=000000000000010b
+      prev: shmcon out=00000000bff01000 len=1044480 head=89 tail=0
+      prev> xnu> early start.
+      usb: clocks.
+      usb: reset done.
+      usb: addr kept.
+      usb: run.
+      xnu> arm_init.
+  So: every start.s milestone through 0x10b ran; `usbcon_early_start`,
+  `usbcon_hw_init` and the SHMCON header/out ring all completed; the pram
+  Device mapping works. The existing `ARM_EARLY_PROBE("xnu>
+  pe_init_platform")` after PE_init_platform(FALSE,args) never appeared, so
+  the next fault is inside PE_init_platform (or it spins until a watchdog
+  resets). The USB console still does not enumerate on the host (`addr
+  kept`, no new tty), so the ring remains the only observation channel.
+  Note the ~3.77 s figure from v24 is superseded: the close-to-next-open
+  time is stage0's own ~30 s runtime plus ~13 s of kernel, so the reset
+  timing is not yet pinned down.
+- **v26 (built, NOT yet flashed): ring probes inside PE_init_platform.**
+  Image `ports/vivo-y21l/out/vivo-boot-peprobe.img` 29,154,538 B, sha256
+  `dcf2f6fa19108e83716d4f47a3e1599f1033f9ba9c639ec880662be83432ff6c`
+  (same kernel size / stage0 / entry as v25). Added
+  `usbcon_early_puts` probes (`PE_EARLY_PROBE`/`IDENT_PROBE`/`DBG_PROBE`,
+  all no-ops off MSM8916_PORT) at:
+  `xnu> pe enter` (PE_init_platform entry), `pe dtinit` (after DTInit),
+  `ident enter`, `soc enter/found|none`, `ident done` (pe_identify_machine
+  and pe_arm_get_soc_base_phys), `pe identify done`, `pe target`, `pe
+  model`, `pe chosen` (each DT lookup block), `dbg enter/debug/stats/api/
+  done` (pe_init_debug) and `pe done` (function exit). The existing
+  `xnu> pe_init_platform` after the call closes the sequence.
+  Patch regenerated: 2091 lines / 20 files, `git apply --check` clean on a
+  fresh 494ffe1. Local kernel build EXIT=0; all probe strings present in
+  the binary.
+  NEXT: the phone is currently cycling and NOT in fastboot (no tty, no
+  fastboot device); power-cycle it into fastboot, then
+  `python3 tools/vivo-console-watch.py -t /tmp/v26.timeline -o /tmp/v26.log 300`,
+  `fastboot flash boot ports/vivo-y21l/out/vivo-boot-peprobe.img`,
+  `fastboot reboot`. Read the LAST `prev>` line of the next stage0 boot:
+  the first missing probe is the fault point. If the ring ends at
+  `xnu> pe enter` the fault is in DTInit/PE_state setup; at `soc enter` in
+  DTFindEntry; at `ident enter` (no `soc enter`) in the compiler's
+  prologue; at `pe identify done` in one of the DTFindEntry/DTLookupEntry
+  blocks; at `dbg enter` in PE_parse_boot_argn; completion prints
+  `xnu> pe done` then the old `xnu> pe_init_platform`.
 - **Port deltas vs sweet:** 32-bit stage0 (real one) must switch AArch32 EL2 -> AArch64
   (lk2nd-style HCR.RW + eret) and then jump to the AArch64 payload; SDHCI eMMC driver,
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
