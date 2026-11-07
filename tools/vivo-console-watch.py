@@ -29,10 +29,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("seconds", nargs="?", type=float, default=0)
     ap.add_argument("-o", "--out")
+    ap.add_argument("-t", "--timeline", help="write one line per read chunk")
     ap.add_argument("--pattern", default="/dev/tty.usbmodem*")
     a = ap.parse_args()
 
     out = open(a.out, "ab") if a.out else None
+    tl = open(a.timeline, "a") if a.timeline else None
     t0 = time.time()
     total = 0
     fd = None
@@ -44,6 +46,12 @@ def main():
         if out:
             out.write(s.encode("latin1"))
             out.flush()
+
+    def note(s):
+        emit(s)
+        if tl:
+            tl.write(f"{time.time():.3f} {s.strip()}\n")
+            tl.flush()
 
     try:
         while True:
@@ -65,7 +73,7 @@ def main():
                 attrs = termios.tcgetattr(fd)
                 attrs[0] = attrs[1] = attrs[2] = 0  # iflag, oflag, cflag: raw
                 termios.tcsetattr(fd, termios.TCSANOW, attrs)
-                emit(f"\n[{stamp()}] open {port}\n")
+                note(f"\n[{stamp()}] open {port}\n")
                 continue
 
             r, _, _ = select.select([fd], [], [], 0.5)
@@ -79,20 +87,24 @@ def main():
                     if d:
                         total += len(d)
                         emit(d.decode("latin1"))
-                    emit(f"\n[{stamp()}] closed {port} (node gone)\n")
+                    note(f"\n[{stamp()}] closed {port} (node gone)\n")
                     os.close(fd)
                     fd = None
                 continue
             try:
                 d = os.read(fd, 65536)
             except OSError:
-                emit(f"\n[{stamp()}] closed {port} (read error)\n")
+                note(f"\n[{stamp()}] closed {port} (read error)\n")
                 os.close(fd)
                 fd = None
                 continue
             if not d:
                 continue
             total += len(d)
+            if tl:
+                last = d.decode("latin1").rstrip("\r\n").split("\n")[-1][:60]
+                tl.write(f"{time.time():.3f} +{len(d)} {last}\n")
+                tl.flush()
             emit(d.decode("latin1"))
     except KeyboardInterrupt:
         pass
@@ -101,6 +113,8 @@ def main():
             os.close(fd)
         if out:
             out.close()
+        if tl:
+            tl.close()
     sys.stderr.write(f"[{total} bytes, {time.time() - t0:.0f} s]\n")
 
 

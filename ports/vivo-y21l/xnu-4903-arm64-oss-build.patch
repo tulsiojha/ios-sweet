@@ -298,10 +298,10 @@ index 0000000..e9ba582
 +if __name__ == '__main__':
 +    main()
 diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index cf49069..8574b3c 100644
+index cf49069..0dd1dfb 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -198,6 +198,18 @@ rebase_threaded_starts(uint32_t *threadArrayStart, uint32_t *threadArrayEnd,
+@@ -198,6 +198,19 @@ rebase_threaded_starts(uint32_t *threadArrayStart, uint32_t *threadArrayEnd,
  extern uint32_t __thread_starts_sect_start[] __asm("section$start$__TEXT$__thread_starts");
  extern uint32_t __thread_starts_sect_end[]   __asm("section$end$__TEXT$__thread_starts");
  
@@ -309,7 +309,8 @@ index cf49069..8574b3c 100644
 +/* Early msm8916 USB console (pexpert/arm/pe_serial.c): start.s maps the
 + * controller into the V=P window, so it works before the VM exists and can
 + * report progress through arm_vm_init. Also used from arm_vm_init.c. */
-+extern void usbcon_early_start(uint64_t phys_base, uint64_t virt_base);
++extern void usbcon_early_start(uint64_t phys_base, uint64_t virt_base,
++    uint64_t mem_size);
 +extern void usbcon_early_puts(const char *s);
 +extern void usbcon_rebind(void);
 +#define ARM_EARLY_PROBE(s) usbcon_early_puts(s)
@@ -320,7 +321,7 @@ index cf49069..8574b3c 100644
  void
  arm_init(
  	boot_args       *args)
-@@ -223,7 +235,16 @@ arm_init(
+@@ -223,7 +236,16 @@ arm_init(
  
  	cpu_data_init(&BootCpuData);
  
@@ -328,7 +329,7 @@ index cf49069..8574b3c 100644
 +	/* Unconditional on this port: the boot args are not parseable until
 +	 * PE_init_platform has published them, and the console is the only
 +	 * way to observe anything this early. */
-+	usbcon_early_start(args->physBase, args->virtBase);
++	usbcon_early_start(args->physBase, args->virtBase, args->memSize);
 +	usbcon_early_puts("xnu> arm_init\r\n");
 +#endif
 +
@@ -337,7 +338,7 @@ index cf49069..8574b3c 100644
  
  #if __arm64__
  
-@@ -287,6 +308,7 @@ arm_init(
+@@ -287,6 +309,7 @@ arm_init(
  #endif
  
  	ml_parse_cpu_topology();
@@ -345,7 +346,7 @@ index cf49069..8574b3c 100644
  
  	master_cpu = ml_get_boot_cpu_number();
  	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
-@@ -336,16 +358,21 @@ arm_init(
+@@ -336,16 +359,21 @@ arm_init(
  	BootCpuData.cpu_processor->processor_data.thread_timer = &thread->system_timer;
  
  	cpu_bootstrap();
@@ -367,7 +368,7 @@ index cf49069..8574b3c 100644
  	my_master_proc = master_processor;
  
  	(void)PE_parse_boot_argn("diag", &arm_diag, sizeof(arm_diag));
-@@ -381,7 +408,9 @@ arm_init(
+@@ -381,7 +409,9 @@ arm_init(
  	__builtin_arm_wsr("pan", 1);
  #endif  /* __ARM_PAN_AVAILABLE__ */
  
@@ -494,7 +495,7 @@ index 6a8d109..422d367 100644
  
  	.text
 diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
-index f709217..7f6e1b2 100644
+index f709217..dcf406f 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
 @@ -33,6 +33,16 @@
@@ -525,9 +526,26 @@ index f709217..7f6e1b2 100644
  	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
  
  #if !(defined(KERNEL_INTEGRITY_KTRR))
-@@ -450,7 +463,10 @@ start_cpu:
+@@ -449,8 +462,27 @@ start_cpu:
+ 	.globl EXT(start_first_cpu)
  LEXT(start_first_cpu)
  
++#if defined(MSM8916_PORT)
++	/*
++	 * DRAM breadcrumb for the next stage0 boot: this store executes with
++	 * the MMU off, so it proves _start_first_cpu ran even if the page
++	 * table setup below dies. The loader prints this word (and clears it)
++	 * before jumping. 0xBFEF0008 is in the DRAM block start.s later maps.
++	 */
++	movz	x9, #0x0008
++	movk	x9, #0xBFEF, lsl #16
++	movz	x10, #0x5a5a
++	movk	x10, #0x5a5a, lsl #16
++	movk	x10, #0x5a5a, lsl #32
++	movk	x10, #0x8916, lsl #48
++	str		x10, [x9]
++#endif /* MSM8916_PORT */
++
  	// Unlock the core for debugging
 +#if !defined(MSM8916_PORT)
 +	/* msm8916 firmware can trap OSLAR_EL1 at EL1 to an unhandled EL2 */
@@ -536,7 +554,7 @@ index f709217..7f6e1b2 100644
  	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
  	mov		x20, x0
  	mov		x21, #0
-@@ -600,6 +616,32 @@ Linvalidate_bootstrap:							// do {
+@@ -600,6 +632,49 @@ Linvalidate_bootstrap:							// do {
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
  
@@ -564,12 +582,29 @@ index f709217..7f6e1b2 100644
 +	mov		x9, #0x00400000					// PS_HOLD (bring-up beacon)
 +	orr		x9, x13, x9
 +	str		x9, [x2, #0x10]					// L2 index 2
++
++	/*
++	 * The top 2 MB of DRAM (the ADT pram/panic area, where the early
++	 * console's SHMCON-style ring lives) is in L1 index 2, whose L2
++	 * table already exists for the V=P kernel mapping. The kernel image
++	 * occupies the first entries of that table; entry 0x1FF (the last
++	 * 2 MB block) is past it and still free. Map that block Device, so
++	 * the early console's ring writes reach DRAM without cache
++	 * maintenance and stage0 can read them back after a reset with the
++	 * MMU off.
++	 */
++	ldr		x9, [x1, #(2 * 8)]				// V=P L1[2] (0x80000000-0xbfffffff)
++	lsl		x9, x9, #12					// clear descriptor flags -> L2 PA
++	lsr		x9, x9, #12
++	mov		x10, #0xBFE00000				// last DRAM 2 MB block
++	orr		x10, x13, x10
++	str		x10, [x9, #0xff8]				// L2 index 0x1FF
 +#endif /* MSM8916_PORT */
 +
  	/* Ensure TTEs are visible */
  	dsb		ish
  
-@@ -743,11 +785,26 @@ common_start:
+@@ -743,11 +818,26 @@ common_start:
  	msr		CPACR_EL1, x0
  #endif
  
@@ -597,7 +632,7 @@ index f709217..7f6e1b2 100644
  	// Initialization common to all Apple targets
  	ARM64_IS_PCORE x15
  	ARM64_READ_EP_SPR x15, x12, ARM64_REG_EHID4, ARM64_REG_HID4
-@@ -756,7 +813,7 @@ common_start:
+@@ -756,7 +846,7 @@ common_start:
  	ARM64_WRITE_EP_SPR x15, x12, ARM64_REG_EHID4, ARM64_REG_HID4
  #endif  // APPLE_ARM64_ARCH_FAMILY
  
@@ -620,10 +655,10 @@ index d296cb6..d9d5953 100644
  ${SOBJS}: assym.s
  
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index 3e70e3f..a36d1fb 100644
+index 3e70e3f..e763a22 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -220,6 +220,855 @@ static struct pe_serial_functions dcc_serial_functions = {
+@@ -220,6 +220,1015 @@ static struct pe_serial_functions dcc_serial_functions = {
  
  /*****************************************************************************/
  
@@ -1329,9 +1364,15 @@ index 3e70e3f..a36d1fb 100644
 +	usbcon_delay_ms(20);
 +}
 +
++#if defined(MSM8916_PORT)
++static void usbcon_shm_puts(const char *s);
++#endif
++
 +static void
 +usbcon_hw_init(void)
 +{
++	uint32_t devaddr, highspeed;
++
 +	usbcon_build_string(usbcon_str_mfr, &usbcon_str_mfr_len, "ios-sweet");
 +	usbcon_build_string(usbcon_str_prod, &usbcon_str_prod_len,
 +	    "vivo Y21L xnu");
@@ -1344,12 +1385,32 @@ index 3e70e3f..a36d1fb 100644
 +	usbcon_ep0_state = USBCON_EP0_IDLE;
 +
 +	usbcon_clocks_init();
++#if defined(MSM8916_PORT)
++	usbcon_shm_puts("usb: clocks\r\n");
++#endif
++
++	/* stage0 has already enumerated this controller and the host holds an
++	 * open tty on it.  USBCMD.RESET below clears DEVICEADDR, but the ULPI
++	 * PHY keeps D+ asserted, so the host neither sees a disconnect nor
++	 * re-enumerates - it keeps addressing the old device address and the
++	 * console stays dead (observed as a silent tty that never goes away).
++	 * Save the address the host assigned and put it back after the reset,
++	 * exactly as the SET_ADDRESS handler would (USBADR is bits 25-31,
++	 * USBADRA bit 24).  A non-zero address also means the host has already
++	 * selected a configuration, so re-do what usbcon_set_config() would
++	 * have done: without it usbcon_configured stays 0 and usbcon_pump()
++	 * never primes EP3. */
++	devaddr = usbcon_rd(USBCON_DEVICEADDR) & 0xfe000000u;
++	highspeed = usbcon_bus_highspeed();
 +
 +	bzero(&usbcon_dma, sizeof(usbcon_dma));
 +
 +	usbcon_wr(USBCON_USBCMD, USBCON_CMD_RESET);
 +	usbcon_delay_ms(20);
 +	usbcon_wait_clear(USBCON_USBCMD, 2, 100);
++#if defined(MSM8916_PORT)
++	usbcon_shm_puts("usb: reset done\r\n");
++#endif
 +
 +	usbcon_wr(USBCON_PORTSC, 0x80000000);   /* PTS = ULPI */
 +	usbcon_ulpi_write(USBCON_ULPI_MISC_A_SET,
@@ -1366,6 +1427,23 @@ index 3e70e3f..a36d1fb 100644
 +	usbcon_wr(USBCON_ENDPTFLUSH, 0xffffffff);
 +	usbcon_wait_clear(USBCON_ENDPTFLUSH, 0xffffffff, 100);
 +
++	if ((devaddr & 0xfe000000u) != 0) {
++		uint32_t mp = highspeed ? 512 : 64;
++
++		usbcon_wr(USBCON_DEVICEADDR, devaddr);
++		usbcon_dma.qh[7].config = (mp << 16) | USBCON_CONFIG_ZLT;
++		usbcon_wr(USBCON_ENDPTCTRL(3),
++		    usbcon_rd(USBCON_ENDPTCTRL(3)) |
++		    USBCON_CTRL_TXE | USBCON_CTRL_TXR | USBCON_CTRL_TXT_BULK);
++		usbcon_dcache_sync(&usbcon_dma.qh[7], sizeof(struct usbcon_qh));
++		usbcon_configured = 1;
++		usbcon_config_value = 1;
++	}
++#if defined(MSM8916_PORT)
++	usbcon_shm_puts((devaddr & 0xfe000000u) ? "usb: addr kept\r\n" :
++	    "usb: addr 0\r\n");
++#endif
++
 +	usbcon_dma.qh[0].config =
 +	    (64u << 16) | USBCON_CONFIG_ZLT | USBCON_CONFIG_IOS;
 +	usbcon_dma.qh[1].config = (64u << 16) | USBCON_CONFIG_ZLT;
@@ -1378,6 +1456,9 @@ index 3e70e3f..a36d1fb 100644
 +	usbcon_dcache_sync(&usbcon_dma, sizeof(usbcon_dma));
 +
 +	usbcon_wr(USBCON_USBCMD, usbcon_rd(USBCON_USBCMD) | USBCON_CMD_RUN);
++#if defined(MSM8916_PORT)
++	usbcon_shm_puts("usb: run\r\n");
++#endif
 +}
 +
 +static void
@@ -1390,19 +1471,119 @@ index 3e70e3f..a36d1fb 100644
 +	usbcon_hw_init();
 +}
 +
++#if defined(MSM8916_PORT)
++/*
++ * Persistent early log for stage0.
++ *
++ * Nothing guarantees that the USB console can be adopted from stage0, and
++ * this kernel currently resets a few seconds into arm_init, so the probes
++ * also go to a SHMCON v2 ring at the ADT "pram" node (physBase + memSize,
++ * top of DRAM). start.s maps that 2 MB block into the V=P window as
++ * Device memory, so a store reaches DRAM immediately and needs no cache
++ * maintenance. The stage0 loader's dump_prev_shmcon() prints the ring on
++ * the next boot, which makes the log survive whatever kills the SoC.
++ * Layout is struct shmcon_header from the SHMCON backend below.
++ */
++#define USBCON_SHM_MAGIC        0x53484d43u     /* 'SHMC' */
++#define USBCON_SHM_VERSION      2
++#define USBCON_SHM_CHILDREN     5
++#define USBCON_SHM_OUT_OFF      0x1000
++#define USBCON_SHM_HEAD_OFF     132             /* midx[CBUF_OUT] */
++#define USBCON_SHM_SIZE         0x100000        /* pram node reg size */
++
++static volatile uint8_t *usbcon_shm_out;
++static volatile uint32_t *usbcon_shm_head;
++static vm_offset_t usbcon_shm_pa;
++static uint32_t usbcon_shm_len;
++static uint32_t usbcon_shm_head_val;
++
++static void
++usbcon_shm_init(vm_offset_t pram_pa)
++{
++	volatile uint32_t *h = (volatile uint32_t *)pram_pa;
++	uint32_t out_pa = (uint32_t)(pram_pa + USBCON_SHM_OUT_OFF);
++	uint32_t out_len = USBCON_SHM_SIZE - USBCON_SHM_OUT_OFF;
++	uint32_t i;
++
++	/* Only the block start.s mapped (the last 2 MB of DRAM). */
++	if ((pram_pa & 0xffe00000u) != 0xbfe00000u) {
++		return;
++	}
++
++	h[0] = 0;                       /* magic last: header not yet valid */
++	__asm__ volatile ("dmb sy" ::: "memory");
++	h[1] = (uint32_t)USBCON_SHM_VERSION |
++	    ((uint32_t)USBCON_SHM_CHILDREN << 8);
++	h[2] = 0;                       /* buf_paddr[CBUF_IN] (unused) */
++	h[3] = 0;
++	h[4] = out_pa;                  /* buf_paddr[CBUF_OUT] */
++	h[5] = 0;
++	h[6] = 0x1000;                  /* buf_len[CBUF_IN] */
++	h[7] = out_len;                 /* buf_len[CBUF_OUT] */
++	for (i = 0; i < 8; i++) {
++		*(volatile uint8_t *)(pram_pa + 32 + i) =
++		    (uint8_t)"AP-xnu  "[i];
++	}
++	*(volatile uint32_t *)(pram_pa + 64) = 0;       /* sidx[CBUF_IN] */
++	*(volatile uint32_t *)(pram_pa + 68) = 0;       /* sidx[CBUF_OUT] */
++	*(volatile uint32_t *)(pram_pa + 128) = 0;      /* midx[CBUF_IN] */
++	*(volatile uint32_t *)(pram_pa + 132) = 0;      /* midx[CBUF_OUT] */
++	for (i = 0; i < USBCON_SHM_CHILDREN; i++) {
++		*(volatile uint64_t *)(pram_pa + 136 + 8 * i) = 0;
++	}
++
++	usbcon_shm_pa = pram_pa;
++	usbcon_shm_out = (volatile uint8_t *)(pram_pa + USBCON_SHM_OUT_OFF);
++	usbcon_shm_head = (volatile uint32_t *)(pram_pa + USBCON_SHM_HEAD_OFF);
++	usbcon_shm_len = out_len;
++	usbcon_shm_head_val = 0;
++
++	__asm__ volatile ("dmb sy" ::: "memory");
++	h[0] = USBCON_SHM_MAGIC;
++	__asm__ volatile ("dmb sy" ::: "memory");
++}
++
++static void
++usbcon_shm_putc(uint8_t c)
++{
++	if (!usbcon_shm_out) {
++		return;
++	}
++	usbcon_shm_out[usbcon_shm_head_val] = c;
++	__asm__ volatile ("dmb sy" ::: "memory");
++	if (++usbcon_shm_head_val >= usbcon_shm_len) {
++		usbcon_shm_head_val = 0;
++	}
++	*usbcon_shm_head = usbcon_shm_head_val;
++}
++
++static void
++usbcon_shm_puts(const char *s)
++{
++	while (*s) {
++		usbcon_shm_putc((uint8_t)*s++);
++	}
++}
++#endif /* MSM8916_PORT */
++
 +/*
 + * Early bring-up from arm_init before arm_vm_init (MSM8916_PORT): start.s
-+ * maps the USB and GCC blocks into the V=P window, so the controller is
-+ * reachable at its physical address here. The DMA block's physical address
-+ * follows the loader's rule pa = va - virtBase + physBase (the kernel
-+ * image is physically contiguous in the payload).
++ * maps the USB, GCC and pram blocks into the V=P window, so the controller
++ * is reachable at its physical address here. The DMA block's physical
++ * address follows the loader's rule pa = va - virtBase + physBase (the
++ * kernel image is physically contiguous in the payload).
 + */
 +void
-+usbcon_early_start(uint64_t phys_base, uint64_t virt_base)
++usbcon_early_start(uint64_t phys_base, uint64_t virt_base, uint64_t mem_size)
 +{
 +	usbcon_base = USBCON_USB_PA;
 +	usbcon_gcc = USBCON_GCC_PA;
 +	usbcon_dma_pa = (vm_offset_t)&usbcon_dma - virt_base + phys_base;
++
++#if defined(MSM8916_PORT)
++	usbcon_shm_init((vm_offset_t)(phys_base + mem_size));
++	usbcon_shm_puts("xnu> early start\r\n");
++#endif
 +
 +	usbcon_hw_init();
 +}
@@ -1412,6 +1593,9 @@ index 3e70e3f..a36d1fb 100644
 +{
 +	uint64_t deadline = usbcon_now_ms() + 500;
 +
++#if defined(MSM8916_PORT)
++	usbcon_shm_puts(s);
++#endif
 +	while (*s) {
 +		usbcon_ring_putc((uint8_t)*s++);
 +	}
@@ -1436,6 +1620,14 @@ index 3e70e3f..a36d1fb 100644
 +{
 +	usbcon_base = ml_io_map(USBCON_USB_PA, USBCON_MAP_SIZE);
 +	usbcon_gcc = ml_io_map(USBCON_GCC_PA, USBCON_MAP_SIZE);
++#if defined(MSM8916_PORT)
++	if (usbcon_shm_pa) {
++		vm_offset_t va = ml_io_map(usbcon_shm_pa, USBCON_SHM_SIZE);
++
++		usbcon_shm_out = (volatile uint8_t *)(va + USBCON_SHM_OUT_OFF);
++		usbcon_shm_head = (volatile uint32_t *)(va + USBCON_SHM_HEAD_OFF);
++	}
++#endif
 +}
 +
 +static int
@@ -1447,6 +1639,9 @@ index 3e70e3f..a36d1fb 100644
 +static void
 +usbcon_td0(int c)
 +{
++#if defined(MSM8916_PORT)
++	usbcon_shm_putc((uint8_t)c);
++#endif
 +	usbcon_ring_putc((uint8_t)c);
 +	usbcon_pump();
 +}
@@ -1479,7 +1674,7 @@ index 3e70e3f..a36d1fb 100644
  #ifdef SHMCON
  
  #define CPU_CACHELINE_SIZE      (1 << MMU_CLINE)
-@@ -383,7 +1232,9 @@ shmcon_init(void)
+@@ -383,7 +1392,9 @@ shmcon_init(void)
  	pa_panic_base = reg_prop[0];
  	panic_size = reg_prop[1];
  
@@ -1490,7 +1685,7 @@ index 3e70e3f..a36d1fb 100644
  	header_size = sizeof(*shmcon) + (NUM_CHILDREN * sizeof(shmcon->child[0]));
  	va_buffer_base = ROUNDUP((uintptr_t)(shmcon) + header_size, CPU_CACHELINE_SIZE);
  	va_buffer_end  = (uintptr_t)shmcon + panic_size - (sizeof(*end));
-@@ -799,6 +1650,9 @@ serial_init(void)
+@@ -799,6 +1810,9 @@ serial_init(void)
  #ifdef SHMCON
  	uint32_t        jconmode;
  #endif
@@ -1500,7 +1695,7 @@ index 3e70e3f..a36d1fb 100644
  #ifdef DOCKFIFO_UART
  	uint32_t        no_dockfifo_uart;
  #endif
-@@ -821,6 +1675,15 @@ serial_init(void)
+@@ -821,6 +1835,15 @@ serial_init(void)
  		uart_initted = 1;
  		return 1;
  	}

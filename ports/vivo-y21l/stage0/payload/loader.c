@@ -148,6 +148,26 @@ static void dump_prev_shmcon(u64 pram_pa)
  * phone off until the power key is held.
  */
 
+/*
+ * Can DRAM survive the reset that ends an xnu run? Write a magic just
+ * below the panic area on every boot and report what the previous boot
+ * left there. This is independent of whether xnu managed to log anything.
+ */
+#define DRAM_PROBE_PA		0xbfef0000ull
+#define DRAM_PROBE_MAGIC	0x4d4152444b524150ull	/* 'PARKDRAM' */
+
+static void
+dram_probe_prev(void)
+{
+	u64 v = rd64(DRAM_PROBE_PA);
+	u64 started = rd64(DRAM_PROBE_PA + 8);
+
+	log_printf("prev: dram %s (%lx) start=%lx\n",
+		   v == DRAM_PROBE_MAGIC ? "kept" : "lost", v, started);
+	*(volatile u64 *)(DRAM_PROBE_PA + 8) = 0;
+	*(volatile u64 *)DRAM_PROBE_PA = DRAM_PROBE_MAGIC;
+}
+
 const char *loader_boot(void)
 {
 	const struct payload *p = (const struct payload *)RD_BASE;
@@ -163,6 +183,7 @@ const char *loader_boot(void)
 		   p->version, p->nsegs, p->virt_base, p->phys_base,
 		   p->mem_size);
 
+	dram_probe_prev();
 	dump_prev_shmcon(p->phys_base + p->mem_size);
 
 	blob_len = p->adt_off + p->adt_size;

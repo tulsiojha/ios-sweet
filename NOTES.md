@@ -526,6 +526,67 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   early console works; still silent with the tty held open -> next beacon goes
   inside usbcon_hw_init (GCC read / bzero / reset), with EL2 CPTR_EL2.TFP as
   the remote second suspect.
+- **v23 TEST (2026-11-06 23:47): FP fix works but xnu still logs nothing - the
+  SoC now resets 3.77 s after the jump.** out/vivo-boot-fp.img (7ae128fa...3e13)
+  flashed OKAY; stage0 streams the full probe and `loader: jumping ... el=1`,
+  then the tty closes 3.770 s later ("read error") and no `vivo Y21L xnu`
+  device appears before the next stage0 boot ~11 s later. The same 3.77 s close
+  repeats every boot (timeline /tmp/vivo-loop.timeline, 4 cycles), i.e. this is
+  a real SoC reset/power cycle, not a hang: pre-FP v19-v22 held the tty open
+  forever with zero bytes. 3.77 s is ~7.5 x the 500 ms usbcon_early_puts pump,
+  which is what every probe costs when `usbcon_configured` stays 0. Two more
+  images probed the adoption theory: out/vivo-boot-kinaddr.img (ec3240fd...daa5,
+  save/restore USBCON_DEVICEADDR across USBCMD.RESET) and
+  out/vivo-boot-adopt.img (5f8d0030...d880, also re-primes EP3 qh[7],
+  ENDPTCTRL(3), sets usbcon_configured=1 when an address existed). BOTH still
+  deliver zero console bytes and the identical 3.77 s close
+  (/tmp/vivo-kin.timeline, /tmp/vivo-adopt.timeline), so the reset is not
+  waiting on the USB path. OBSERVATION: after an xnu reset the DT bootargs
+  sometimes change `bootreason=1` -> `bootreason=2` (/tmp/vivo-kin.log); the
+  meaning of those values in this LK is not known. USB observation that matters:
+  the controller is never re-enumerated (no `vivo Y21L xnu` node), so either
+  USBCMD.RESET never runs or the ULPI PHY keeps D+ asserted and the host's
+  stale address/pipes make the console dead even if it does.
+- **v24 (built, NOT yet flashed): persistent DRAM log ring + DRAM-survival
+  probe - get xnu's probe text without USB.** Image
+  `ports/vivo-y21l/out/vivo-boot-shmring.img` 29,154,538 B, sha256
+  1db90c8194fec7d7dcc76a87d3a0f5ee9eb165dfe885237dd90ab8d428be833d (kernel
+  10,210,320 B, stage0 40,544 B). Since the phone resets by itself 3.77 s in,
+  the log now goes somewhere it can be read after the reset:
+  (1) usbcon_early_start(physBase, virtBase, memSize) also initializes a
+  SHMCON v2 header at physBase+memSize = 0xBFF00000 (the ADT "pram" node:
+  magic/version/children/buf_paddr/buf_len, name AP-xnu, sidx/midx at +64/+128,
+  out buffer 0xBFF01000..0xBFFFF000, head at +132) and usbcon_early_puts
+  duplicates every probe into it. Writes go through a Device mapping start.s
+  now installs for the last DRAM 2 MB block (0xBFE00000, L1 index 2 ->
+  existing V=P L2 entry 0x1FF), so they reach DRAM with no cache maintenance.
+  usbcon_hw_init also logs `usb: clocks`, `usb: reset done`,
+  `usb: addr kept|addr 0`, `usb: run` to the ring, and usbcon_rebind re-points
+  it after pmap_bootstrap. The loader's existing dump_prev_shmcon() prints the
+  ring (`prev: shmcon out=... len=... head=... tail=...` + `prev> text`) on the
+  NEXT stage0 boot, before it reloads segments.
+  (2) DRAM survival probe: loader.c writes magic 0x4d4152444b524150
+  ('PARKDRAM') at 0xBFEF0000 on every boot and logs
+  `prev: dram kept|lost (<magic>) start=<word>`; the `start=` word is
+  0x89165a5a5a5a5a5a, written by start.s's first instructions with the MMU
+  off (0xBFEF0008), so it proves `_start_first_cpu` executed even if start.s
+  dies. The loader clears it before the jump, so each value belongs to the
+  previous boot.
+  READING KEY for the next boot after flashing: `prev: dram lost` -> the
+  3.77 s event is a full power cycle (DRAM does not survive) and this whole
+  approach is dead; `prev: dram kept` + `start=89165a5a...` + `prev>` text ->
+  the reset is warm, and the text shows the last probe reached (probes:
+  `xnu> early start`, `xnu> arm_init`, `usb: clocks/reset done/addr/run`,
+  `xnu> pe_init_platform`, `cpu_topology`, `cpu_bootstrap`,
+  `rtclock_early_init`, `kernel_early_bootstrap`, `cpu_init`,
+  `processor_bootstrap`, `arm_vm_init`, `avm enter/early_random/ttbr0
+  off/pmap up/done`); `start=0` + no ring text -> xnu never entered start.s
+  (loader/jump problem). Patch regenerated: 1801 lines / 17 files, `git apply
+  --check` clean on a fresh 494ffe1 (now also carries the kinaddr/adopt edits).
+  Boot partition still holds `vivo-boot-adopt.img`; flash v24 with
+  `fastboot flash boot out/vivo-boot-shmring.img` after power-cycling the
+  phone into fastboot, then start `tools/vivo-console-watch.py -t
+  /tmp/xnu-shmring.timeline -o /tmp/xnu-shmring.log 60` before rebooting.
 - **Port deltas vs sweet:** 32-bit stage0 (real one) must switch AArch32 EL2 -> AArch64
   (lk2nd-style HCR.RW + eret) and then jump to the AArch64 payload; SDHCI eMMC driver,
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
