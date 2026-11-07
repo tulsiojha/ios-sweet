@@ -161,9 +161,12 @@ dram_probe_prev(void)
 {
 	u64 v = rd64(DRAM_PROBE_PA);
 	u64 started = rd64(DRAM_PROBE_PA + 8);
+	u64 milestone = rd64(DRAM_PROBE_PA + 0x10);
 
-	log_printf("prev: dram %s (%lx) start=%lx\n",
-		   v == DRAM_PROBE_MAGIC ? "kept" : "lost", v, started);
+	log_printf("prev: dram %s (%lx) start=%lx ms=%lx\n",
+		   v == DRAM_PROBE_MAGIC ? "kept" : "lost", v, started,
+		   milestone);
+	*(volatile u64 *)(DRAM_PROBE_PA + 0x10) = 0;
 	*(volatile u64 *)(DRAM_PROBE_PA + 8) = 0;
 	*(volatile u64 *)DRAM_PROBE_PA = DRAM_PROBE_MAGIC;
 }

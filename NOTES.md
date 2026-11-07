@@ -583,10 +583,64 @@ DTB copied to `vivo.dtb` (repo root, gitignored). Full adb dump in
   off/pmap up/done`); `start=0` + no ring text -> xnu never entered start.s
   (loader/jump problem). Patch regenerated: 1801 lines / 17 files, `git apply
   --check` clean on a fresh 494ffe1 (now also carries the kinaddr/adopt edits).
-  Boot partition still holds `vivo-boot-adopt.img`; flash v24 with
-  `fastboot flash boot out/vivo-boot-shmring.img` after power-cycling the
-  phone into fastboot, then start `tools/vivo-console-watch.py -t
-  /tmp/xnu-shmring.timeline -o /tmp/xnu-shmring.log 60` before rebooting.
+  Boot partition held `vivo-boot-adopt.img` before this; v24 was flashed
+  2026-11-07 09:09 and the phone is currently hung after its last jump.
+- **v24 TEST (2026-11-07 09:09 / 09:26): kernel entry CONFIRMED, and the
+  silence is a start.s bug, not a jump/USB problem.** First boot after the
+  flash printed `prev: dram kept (4d4152444b524150) start=0000000000000000`
+  and `prev: no shmcon log (magic=ffffffff)`; the tty stayed open with zero
+  bytes (no 3.77 s reset). The user power-cycled the phone, and the next
+  stage0 boot printed
+  `prev: dram kept (4d4152444b524150) start=89165a5a5a5a5a5a`:
+  `_start_first_cpu` really did execute (the breadcrumb was written) and
+  DRAM survives the warm reset. The SHMCON magic was still 0xffffffff on
+  both boots, so xnu dies between the first start.s instruction and
+  `usbcon_early_start`.
+  ROOT CAUSE (found by disassembling the v24 kernel): the pram Device entry
+  was written 3 bytes off. In the v24 start.s code,
+  `ldr x9,[x1,#16]` (V=P L1[2] = 0x89a6e003) followed by
+  `lsl x9,x9,#12; lsr x9,x9,#12` is an identity operation - it does not
+  clear the low descriptor flags - so `str x10,[x9,#0xff8]` wrote at
+  0x89a6effb instead of 0x89a6eff8. Result: the V=P L2 entry 0x1FF
+  (0xBFE00000..0xBFFFFFFF, i.e. the pram at 0xBFF00000) is corrupt/invalid.
+  `usbcon_shm_init`'s first store (`h[0]=0` to 0xBFF00000) then takes a
+  translation fault in xnu's pre-console vector, which reads as a silent
+  hang with the tty still open. Two secondary bugs: the fifth bootstrap
+  page (the device L2 at x25+4 pages) was used without being zeroed (508
+  stale entries), and T7000/APPLETYPHOON defines
+  `__ARM_IC_NOALIAS_ICACHE__`, which compiles out start.s's stock
+  `tlbi vmalle1; ic iallu`, so stale LK TLB entries can survive the
+  monitor's eret.
+- **v25 (built, NOT yet flashed): pram mask fix + device-L2 clear + TLB
+  invalidate + DRAM milestones.** Image
+  `ports/vivo-y21l/out/vivo-boot-pramfix.img` 29,154,538 B, sha256
+  `27ccd5948bac3a0b745abc32dbf232308323a66ef81a5143caa3a75741177634`
+  (kernel 10,210,320 B, stage0 40,560 B, payload 10,217,184 B, entry still
+  `0xfffffff0070f90a0`). Changes: (1) the pram entry now uses
+  `and x9,x9,#(ARM_TTE_TABLE_MASK)` (verified as `92748d29` at
+  `_start_first_cpu+0x2b4`); (2) the device L2 page is cleared with 512
+  zero stores before `create_l1_table_entry`; (3) the stock TLB/icache
+  block now also runs under `MSM8916_PORT` (`tlbi vmalle1; ic iallu` at
+  `common_start+0x64`, ordered by the 0x106 dsb); (4) a single milestone
+  word at 0xBFEF0010 is overwritten by start.s/arm_init, and the stage0
+  loader prints it as `prev: ... ms=<hex>`. Decode: 0x101 bootstrap
+  invalidate, 0x102 V=P map, 0x103 KVA map, 0x104 device L2+blocks,
+  0x105 pram block installed, 0x106 just before SCTLR (MMU still off),
+  0x107 after the first post-MMU Device store (pram mapping works),
+  0x108 FP enabled, 0x109 about to `ret` to arm_init, 0x10a arm_init
+  entered (C), 0x10b about to call `usbcon_early_start`. A SHMCON magic +
+  `prev>` text means `usbcon_shm_init` completed; `ms=0x106` means the
+  MMU enable or the pram store failed; `ms=0x109`+magic=ffffffff means the
+  fault is inside arm_init before/at `usbcon_early_start`.
+  Patch regenerated: 1908 lines / 17 files, `git apply --check` clean on a
+  fresh 494ffe1. Local kernel build EXIT=0; disassembly verified (and,
+  milestones and tlbi all present).
+  NEXT: power-cycle the phone into fastboot, then
+  `python3 tools/vivo-console-watch.py -t /tmp/v25.timeline -o /tmp/v25.log 300`,
+  `fastboot flash boot ports/vivo-y21l/out/vivo-boot-pramfix.img`,
+  `fastboot reboot`. The first loader line reports the previous (v24) run
+  (`ms=0`); the v25 run's `ms`/ring appears on the FOLLOWING stage0 boot
+  (automatic if the 3.77 s reset returns, otherwise power-cycle once).
 - **Port deltas vs sweet:** 32-bit stage0 (real one) must switch AArch32 EL2 -> AArch64
   (lk2nd-style HCR.RW + eret) and then jump to the AArch64 payload; SDHCI eMMC driver,
   GICv2 (msm8916) in the FDT platform expert, display via MDSS/DSI command-mode panel
